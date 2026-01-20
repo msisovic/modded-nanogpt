@@ -1320,8 +1320,8 @@ class GPT(nn.Module):
             H_pre = H_pre.unsqueeze(-2)  # (B, S, 1, n)
 
             # H_post: expand 1 -> n lanes
-            H_post_raw = hc_alpha_post[i] * torch.tanh(torch.einsum('od,bsd->bso', hc_theta_post[i], x_tilde.sum(dim=2)))
-            H_post = (H_post_raw + hc_b_post[i].squeeze(-1)).unsqueeze(-1)  # (B, S, n, 1)
+            H_post_raw = hc_alpha_post[i] * torch.tanh(torch.einsum('od,bsd->bso', hc_theta_post[i], x_tilde.sum(dim=2))).unsqueeze(-2)
+            H_post = H_post_raw + hc_b_post[i]  # (B, S, n, 1)
 
             # H_res: mix n -> n lanes
             H_res = hc_alpha_res[i] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_res[i], x_tilde).unsqueeze(-1).expand(-1, -1, -1, self.n_lanes)) + hc_b_res[i]
@@ -1903,6 +1903,16 @@ model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.attn_bank.data = model.attn_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+# Hyperconnection parameters
+model.hyper_theta_pre.data = model.hyper_theta_pre.data.bfloat16()
+model.hyper_alpha_pre.data = model.hyper_alpha_pre.data.bfloat16()
+model.hyper_b_pre.data = model.hyper_b_pre.data.bfloat16()
+model.hyper_theta_post.data = model.hyper_theta_post.data.bfloat16()
+model.hyper_alpha_post.data = model.hyper_alpha_post.data.bfloat16()
+model.hyper_b_post.data = model.hyper_b_post.data.bfloat16()
+model.hyper_theta_res.data = model.hyper_theta_res.data.bfloat16()
+model.hyper_alpha_res.data = model.hyper_alpha_res.data.bfloat16()
+model.hyper_b_res.data = model.hyper_b_res.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
