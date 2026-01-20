@@ -1037,31 +1037,6 @@ class MLP(nn.Module):
         # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
         return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
 
-class HyperConnection(nn.Module):
-    """
-    Hyperconnection module for dynamic lane mixing.
-    Implements H = alpha * tanh(theta @ x_norm) + b for pre/post/res matrices.
-    """
-    def __init__(self, dim: int, n_lanes: int = 4):
-        super().__init__()
-        self.n_lanes = n_lanes
-        self.dim = dim
-
-        # H_pre: aggregate n lanes -> 1
-        self.theta_pre = nn.Parameter(torch.randn(n_lanes, dim) * 0.02)
-        self.alpha_pre = nn.Parameter(torch.zeros(1, n_lanes))  # init to 0 per DHC paper
-        self.b_pre = nn.Parameter(torch.zeros(1, n_lanes) + 1.0 / n_lanes)  # init to uniform avg
-
-        # H_post: expand 1 -> n lanes
-        self.theta_post = nn.Parameter(torch.randn(1, dim) * 0.02)
-        self.alpha_post = nn.Parameter(torch.zeros(n_lanes, 1))  # init to 0 per DHC paper
-        self.b_post = nn.Parameter(torch.ones(n_lanes, 1))  # init to broadcast equally
-
-        # H_res: mix n -> n lanes
-        self.theta_res = nn.Parameter(torch.randn(n_lanes, dim) * 0.02)
-        self.alpha_res = nn.Parameter(torch.zeros(n_lanes, n_lanes))  # init to 0 per DHC paper
-        self.b_res = nn.Parameter(torch.eye(n_lanes))  # init to identity (standard residual)
-
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool):
         super().__init__()
@@ -1110,15 +1085,35 @@ class GPT(nn.Module):
         nn.init.zeros_(self.skip_gate.weight)
         self.skip_gate.weight.label = 'skip_gate'
 
-        # Hyperconnection parameters for dynamic lane mixing
+        # Hyperconnection parameter banks for dynamic lane mixing (stacked across layers)
         self.n_lanes = 4
-        self.hyper_connections = nn.ModuleList([
-            HyperConnection(model_dim, self.n_lanes) for _ in range(num_layers)
-        ])
-        # Label all hyperconnection parameters
-        for hc in self.hyper_connections:
-            for name, param in hc.named_parameters():
-                param.label = f'hyper_{name}'  # e.g., 'hyper_theta_pre'
+        n = self.n_lanes
+        
+        # H_pre: aggregate n lanes -> 1
+        self.hyper_theta_pre = nn.Parameter(torch.randn(num_layers, n, model_dim) * 0.02)
+        self.hyper_alpha_pre = nn.Parameter(torch.zeros(num_layers, 1, n))
+        self.hyper_b_pre = nn.Parameter(torch.zeros(num_layers, 1, n) + 1.0 / n)
+        
+        # H_post: expand 1 -> n lanes
+        self.hyper_theta_post = nn.Parameter(torch.randn(num_layers, 1, model_dim) * 0.02)
+        self.hyper_alpha_post = nn.Parameter(torch.zeros(num_layers, n, 1))
+        self.hyper_b_post = nn.Parameter(torch.ones(num_layers, n, 1))
+        
+        # H_res: mix n -> n lanes
+        self.hyper_theta_res = nn.Parameter(torch.randn(num_layers, n, model_dim) * 0.02)
+        self.hyper_alpha_res = nn.Parameter(torch.zeros(num_layers, n, n))
+        self.hyper_b_res = nn.Parameter(torch.eye(n).unsqueeze(0).expand(num_layers, -1, -1).clone())
+        
+        # Label hyperconnection banks
+        self.hyper_theta_pre.label = 'hyper_theta_pre'
+        self.hyper_alpha_pre.label = 'hyper_alpha_pre'
+        self.hyper_b_pre.label = 'hyper_b_pre'
+        self.hyper_theta_post.label = 'hyper_theta_post'
+        self.hyper_alpha_post.label = 'hyper_alpha_post'
+        self.hyper_b_post.label = 'hyper_b_post'
+        self.hyper_theta_res.label = 'hyper_theta_res'
+        self.hyper_alpha_res.label = 'hyper_alpha_res'
+        self.hyper_b_res.label = 'hyper_b_res'
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
@@ -1292,6 +1287,17 @@ class GPT(nn.Module):
         attn_weights = self.attn_bank.unbind(0)  # tuple of [4*dim, hdim] tensors
         mlp_fcs = self.mlp_bank[:, 0, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
         mlp_projs = self.mlp_bank[:, 1, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
+        
+        # unbind hyperconnection banks
+        hc_theta_pre = self.hyper_theta_pre.unbind(0)
+        hc_alpha_pre = self.hyper_alpha_pre.unbind(0)
+        hc_b_pre = self.hyper_b_pre.unbind(0)
+        hc_theta_post = self.hyper_theta_post.unbind(0)
+        hc_alpha_post = self.hyper_alpha_post.unbind(0)
+        hc_b_post = self.hyper_b_post.unbind(0)
+        hc_theta_res = self.hyper_theta_res.unbind(0)
+        hc_alpha_res = self.hyper_alpha_res.unbind(0)
+        hc_b_res = self.hyper_b_res.unbind(0)
 
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
@@ -1306,22 +1312,19 @@ class GPT(nn.Module):
                 ve_gate_w=ve_gates[i]
             )
 
-            # Get hyperconnection for this layer
-            hc = self.hyper_connections[i]
-
             # 1. Compute H matrices from normalized lanes
             x_tilde = norm(x_lanes)  # (B, S, n, d)
 
             # H_pre: aggregate n lanes -> 1
-            H_pre = hc.alpha_pre * torch.tanh(torch.einsum('nd,bsnd->bsn', hc.theta_pre, x_tilde)) + hc.b_pre
+            H_pre = hc_alpha_pre[i] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_pre[i], x_tilde)) + hc_b_pre[i]
             H_pre = H_pre.unsqueeze(-2)  # (B, S, 1, n)
 
             # H_post: expand 1 -> n lanes
-            H_post_raw = hc.alpha_post * torch.tanh(torch.einsum('od,bsd->bso', hc.theta_post, x_tilde.sum(dim=2)))
-            H_post = (H_post_raw + hc.b_post.squeeze(-1)).unsqueeze(-1)  # (B, S, n, 1)
+            H_post_raw = hc_alpha_post[i] * torch.tanh(torch.einsum('od,bsd->bso', hc_theta_post[i], x_tilde.sum(dim=2)))
+            H_post = (H_post_raw + hc_b_post[i].squeeze(-1)).unsqueeze(-1)  # (B, S, n, 1)
 
             # H_res: mix n -> n lanes
-            H_res = hc.alpha_res * torch.tanh(torch.einsum('nd,bsnd->bsn', hc.theta_res, x_tilde).unsqueeze(-1).expand(-1, -1, -1, hc.n_lanes)) + hc.b_res
+            H_res = hc_alpha_res[i] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_res[i], x_tilde).unsqueeze(-1).expand(-1, -1, -1, self.n_lanes)) + hc_b_res[i]
 
             # 2. Skip OUT (before aggregation, on lanes)
             if i in skip_out:
