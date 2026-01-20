@@ -1037,6 +1037,31 @@ class MLP(nn.Module):
         # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
         return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
 
+class HyperConnection(nn.Module):
+    """
+    Hyperconnection module for dynamic lane mixing.
+    Implements H = alpha * tanh(theta @ x_norm) + b for pre/post/res matrices.
+    """
+    def __init__(self, dim: int, n_lanes: int = 4):
+        super().__init__()
+        self.n_lanes = n_lanes
+        self.dim = dim
+
+        # H_pre: aggregate n lanes -> 1
+        self.theta_pre = nn.Parameter(torch.randn(n_lanes, dim) * 0.02)
+        self.alpha_pre = nn.Parameter(torch.zeros(1, n_lanes))  # init to 0 per DHC paper
+        self.b_pre = nn.Parameter(torch.zeros(1, n_lanes) + 1.0 / n_lanes)  # init to uniform avg
+
+        # H_post: expand 1 -> n lanes
+        self.theta_post = nn.Parameter(torch.randn(1, dim) * 0.02)
+        self.alpha_post = nn.Parameter(torch.zeros(n_lanes, 1))  # init to 0 per DHC paper
+        self.b_post = nn.Parameter(torch.ones(n_lanes, 1))  # init to broadcast equally
+
+        # H_res: mix n -> n lanes
+        self.theta_res = nn.Parameter(torch.randn(n_lanes, dim) * 0.02)
+        self.alpha_res = nn.Parameter(torch.zeros(n_lanes, n_lanes))  # init to 0 per DHC paper
+        self.b_res = nn.Parameter(torch.eye(n_lanes))  # init to identity (standard residual)
+
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool):
         super().__init__()
@@ -1052,10 +1077,11 @@ class Block(nn.Module):
         self.mlp = MLP() if has_mlp else None
 
     def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor = None, c_fc: Tensor = None, c_proj: Tensor = None):
+        # Hyperconnections handle residuals externally - return raw sublayer outputs
         if self.attn is not None:
-            x = x + self.attn(norm(x), attn_args, qkvo_w)
+            x = self.attn(norm(x), attn_args, qkvo_w)
         if self.mlp is not None:
-            x = x + self.mlp(norm(x), c_fc, c_proj)
+            x = self.mlp(norm(x), c_fc, c_proj)
         return x
 
 # -----------------------------------------------------------------------------
@@ -1083,6 +1109,16 @@ class GPT(nn.Module):
         self.skip_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.skip_gate.weight)
         self.skip_gate.weight.label = 'skip_gate'
+
+        # Hyperconnection parameters for dynamic lane mixing
+        self.n_lanes = 4
+        self.hyper_connections = nn.ModuleList([
+            HyperConnection(model_dim, self.n_lanes) for _ in range(num_layers)
+        ])
+        # Label all hyperconnection parameters
+        for hc in self.hyper_connections:
+            for name, param in hc.named_parameters():
+                param.label = f'hyper_{name}'  # e.g., 'hyper_theta_pre'
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
@@ -1241,6 +1277,9 @@ class GPT(nn.Module):
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
+        # Expand to lanes for hyperconnections: (B, S, d) -> (B, S, n, d)
+        x_lanes = x.unsqueeze(2).expand(-1, -1, self.n_lanes, -1).clone()
+
         # unbind gate banks to avoid select_backwards kernel
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)] 
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
@@ -1266,27 +1305,69 @@ class GPT(nn.Module):
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i]
             )
+
+            # Get hyperconnection for this layer
+            hc = self.hyper_connections[i]
+
+            # 1. Compute H matrices from normalized lanes
+            x_tilde = norm(x_lanes)  # (B, S, n, d)
+
+            # H_pre: aggregate n lanes -> 1
+            H_pre = hc.alpha_pre * torch.tanh(torch.einsum('nd,bsnd->bsn', hc.theta_pre, x_tilde)) + hc.b_pre
+            H_pre = H_pre.unsqueeze(-2)  # (B, S, 1, n)
+
+            # H_post: expand 1 -> n lanes
+            H_post_raw = hc.alpha_post * torch.tanh(torch.einsum('od,bsd->bso', hc.theta_post, x_tilde.sum(dim=2)))
+            H_post = (H_post_raw + hc.b_post.squeeze(-1)).unsqueeze(-1)  # (B, S, n, 1)
+
+            # H_res: mix n -> n lanes
+            H_res = hc.alpha_res * torch.tanh(torch.einsum('nd,bsnd->bsn', hc.theta_res, x_tilde).unsqueeze(-1).expand(-1, -1, -1, hc.n_lanes)) + hc.b_res
+
+            # 2. Skip OUT (before aggregation, on lanes)
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
-                x = x + skip_gate_out * skip_connections.pop()
+                x_lanes = x_lanes + skip_gate_out.unsqueeze(-2) * skip_connections.pop()
+
+            # 3. Aggregate: (B, S, 1, n) @ (B, S, n, d) -> (B, S, 1, d) -> squeeze -> (B, S, d)
+            x_agg = (H_pre @ x_lanes).squeeze(-2)
+
+            # 4. Apply x0/bigram mixing (on aggregated signal)
             if i == 0:
-                x = (resid_lambdas[0] + x0_lambdas[0]) * x + bigram_lambdas[0] * x0_bigram
+                x_agg = (resid_lambdas[0] + x0_lambdas[0]) * x_agg + bigram_lambdas[0] * x0_bigram
             else:
-                x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
-            
+                x_agg = resid_lambdas[i] * x_agg + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
+
             # Get weights for this layer from banks
             qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
             c_fc = mlp_fcs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
             c_proj = mlp_projs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
-            
-            x = self.blocks[i](x, attn_args, qkvo_w, c_fc, c_proj)
+
+            # 5. Pass through block (returns raw output, no internal residual)
+            layer_out = self.blocks[i](x_agg, attn_args, qkvo_w, c_fc, c_proj)
+
+            # 6. Expand back to lanes: (B, S, d) -> (B, S, 1, d) -> H_post @ ... -> (B, S, n, d)
+            x_expanded = H_post @ layer_out.unsqueeze(-2)  # (B, S, n, 1) @ (B, S, 1, d) -> (B, S, n, d)
+
+            # 7. Mix original lanes (residual path)
+            x_mixed = torch.einsum('bsnm,bsmd->bsnd', H_res, x_lanes)
+
+            # 8. Combine
+            x_lanes = x_mixed + x_expanded
+
+            # 9. Skip IN (after block processing, on lanes)
             if i in skip_in:
-                skip_connections.append(x)
+                skip_connections.append(x_lanes.clone())
+
+            # 10. Backout save
             if i == backout_layer:
-                x_backout = x
+                x_backout = x_lanes.clone()
 
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
-        x -= backout_lambda * x_backout
+        x_lanes = x_lanes - backout_lambda * x_backout
+
+        # Final aggregation: sum across lanes (B, S, n, d) -> (B, S, d)
+        x = x_lanes.sum(dim=2)
+
         x = norm(x)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
@@ -1587,12 +1668,25 @@ class TrainingManager():
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            # Hyperconnection parameters
+            "hyper_theta_pre":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
+            "hyper_alpha_pre":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
+            "hyper_b_pre":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
+            "hyper_theta_post": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
+            "hyper_alpha_post": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
+            "hyper_b_post":     {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
+            "hyper_theta_res":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
+            "hyper_alpha_res":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
+            "hyper_b_res":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
         }
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
+            "hyper_theta_pre", "hyper_alpha_pre", "hyper_b_pre",      # Hyperconnection params (small)
+            "hyper_theta_post", "hyper_alpha_post", "hyper_b_post",
+            "hyper_theta_res", "hyper_alpha_res", "hyper_b_res",
             "ve0", "ve1", "ve2", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
