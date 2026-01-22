@@ -1098,17 +1098,17 @@ class GPT(nn.Module):
 
         # H_pre: aggregate n lanes -> 1
         self.hyper_theta_pre = nn.Parameter(torch.randn(num_sublayers, n, model_dim) * 0.02)
-        self.hyper_alpha_pre = nn.Parameter(torch.zeros(num_sublayers, 1, n))
+        self.hyper_alpha_pre = nn.Parameter(torch.zeros(num_sublayers, 1, n) + 0.02)
         self.hyper_b_pre = nn.Parameter(torch.zeros(num_sublayers, 1, n) + 1.0 / n)
 
         # H_post: expand 1 -> n lanes
         self.hyper_theta_post = nn.Parameter(torch.randn(num_sublayers, 1, model_dim) * 0.02)
-        self.hyper_alpha_post = nn.Parameter(torch.zeros(num_sublayers, n, 1))
+        self.hyper_alpha_post = nn.Parameter(torch.zeros(num_sublayers, n, 1) + 0.02)
         self.hyper_b_post = nn.Parameter(torch.ones(num_sublayers, n, 1))
 
         # H_res: mix n -> n lanes
         self.hyper_theta_res = nn.Parameter(torch.randn(num_sublayers, n, model_dim) * 0.02)
-        self.hyper_alpha_res = nn.Parameter(torch.zeros(num_sublayers, n, n))
+        self.hyper_alpha_res = nn.Parameter(torch.zeros(num_sublayers, n, n) + 0.02)
         self.hyper_b_res = nn.Parameter(torch.eye(n).unsqueeze(0).expand(num_sublayers, -1, -1).clone())
         
         # Label hyperconnection banks
@@ -1699,15 +1699,15 @@ class TrainingManager():
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             # Hyperconnection parameters
-            "hyper_theta_pre":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
-            "hyper_alpha_pre":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
-            "hyper_b_pre":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
-            "hyper_theta_post": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
-            "hyper_alpha_post": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
-            "hyper_b_post":     {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
-            "hyper_theta_res":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
-            "hyper_alpha_res":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
-            "hyper_b_res":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
+            "hyper_theta_pre":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_alpha_pre":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_b_pre":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_theta_post": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_alpha_post": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_b_post":     {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_theta_res":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_alpha_res":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_b_res":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
         }
 
         # - Process smaller/faster params first while large reduces complete
