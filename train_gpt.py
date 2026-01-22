@@ -1096,32 +1096,34 @@ class GPT(nn.Module):
         n = self.n_lanes
         num_sublayers = len(self.attn_layer_indices) + len(self.mlp_layer_indices)  # 10 + 11 = 21
 
-        # H_pre: aggregate n lanes -> 1
+        # H_pre: aggregate n lanes -> 1 (predicts n weights)
         self.hyper_theta_pre = nn.Parameter(torch.zeros(num_sublayers, n, model_dim))
-        self.hyper_alpha_pre = nn.Parameter(torch.zeros(num_sublayers, 1, n))
-        self.hyper_b_pre = nn.Parameter(torch.empty(num_sublayers, 1, n))
+        self.hyper_alpha_pre = nn.Parameter(torch.full((num_sublayers, 1, n), 0.01))
+        self.hyper_b_pre = nn.Parameter(torch.zeros(num_sublayers, 1, n))
 
-        # H_post: expand 1 -> n lanes
-        self.hyper_theta_post = nn.Parameter(torch.zeros(num_sublayers, 1, model_dim))
-        self.hyper_alpha_post = nn.Parameter(torch.zeros(num_sublayers, n, 1))
-        self.hyper_b_post = nn.Parameter(torch.empty(num_sublayers, n, 1))
+        # H_post: expand 1 -> n lanes (predicts n weights - FIXED: was 1)
+        self.hyper_theta_post = nn.Parameter(torch.zeros(num_sublayers, n, model_dim))
+        self.hyper_alpha_post = nn.Parameter(torch.full((num_sublayers, n, 1), 0.01))
+        self.hyper_b_post = nn.Parameter(torch.zeros(num_sublayers, n, 1))
 
-        # H_res: mix n -> n lanes
-        self.hyper_theta_res = nn.Parameter(torch.zeros(num_sublayers, n, model_dim))
-        self.hyper_alpha_res = nn.Parameter(torch.zeros(num_sublayers, n, n))
-        self.hyper_b_res = nn.Parameter(torch.empty(num_sublayers, n, n))
+        # H_res: mix n -> n lanes (predicts n*n weights - FIXED: was n)
+        self.hyper_theta_res = nn.Parameter(torch.zeros(num_sublayers, n * n, model_dim))
+        self.hyper_alpha_res = nn.Parameter(torch.full((num_sublayers, n, n), 0.01))
+        self.hyper_b_res = nn.Parameter(torch.zeros(num_sublayers, n, n))
 
-        # Static init to mimic a pre-norm residual block at step 0
+        # Static init to PRECISELY mimic a pre-norm residual block at step 0
+        # Reference: Paper Equation 14 & Section 2.3
         with torch.no_grad():
-            self.hyper_b_pre.zero_()
-            if n > 1:
-                self.hyper_b_pre[:, 0, 1:] = 1.0
-            else:
-                self.hyper_b_pre[:, 0, 0] = 1.0
+            # H_pre (Aggregation): Select exactly ONE lane based on sublayer index (cycling)
+            for i in range(num_sublayers):
+                active_lane = i % n
+                self.hyper_b_pre[i, 0, active_lane] = 1.0
+            
+            # H_post (Expansion): Broadcast output to ALL lanes
             self.hyper_b_post.fill_(1.0)
-            base_eye = torch.eye(n)
-            base_shift = torch.roll(base_eye, shifts=1, dims=1)
-            self.hyper_b_res.copy_((base_eye + base_shift).unsqueeze(0).expand(num_sublayers, -1, -1))
+            
+            # H_res (Residual): Identity only (no shifting/mixing at start)
+            self.hyper_b_res.copy_(torch.eye(n).unsqueeze(0).expand(num_sublayers, -1, -1))
         
         # Label hyperconnection banks
         self.hyper_theta_pre.label = 'hyper_theta_pre'
@@ -1343,14 +1345,27 @@ class GPT(nn.Module):
             # === ATTENTION HYPERCONNECTION ===
             if has_attn:
                 attn_idx = self.sublayer_to_attn_hyper_idx[i]
+                bsz, seq_len, n_lanes, d_model = x_lanes.shape
 
                 # H matrices for attention sublayer
                 x_tilde = norm(x_lanes)
-                H_pre = hc_alpha_pre[attn_idx] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_pre[attn_idx], x_tilde)) + hc_b_pre[attn_idx]
+                x_agg_for_pred = x_tilde.sum(dim=2)  # (B, S, D) - aggregated for predictions
+                
+                # H_pre: predicts n weights for aggregation
+                H_pre_raw = (x_tilde * hc_theta_pre[attn_idx]).sum(dim=-1)  # (B, S, n)
+                H_pre = hc_alpha_pre[attn_idx] * torch.tanh(H_pre_raw) + hc_b_pre[attn_idx]  # (B, S, 1, n)
                 H_pre = H_pre.unsqueeze(-2)
-                H_post_raw = hc_alpha_post[attn_idx] * torch.tanh(torch.einsum('od,bsd->bso', hc_theta_post[attn_idx], x_tilde.sum(dim=2))).unsqueeze(-2)
-                H_post = H_post_raw + hc_b_post[attn_idx]
-                H_res = hc_alpha_res[attn_idx] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_res[attn_idx], x_tilde).unsqueeze(-1).expand(-1, -1, -1, self.n_lanes)) + hc_b_res[attn_idx]
+                
+                # H_post: predicts n weights for expansion (FIXED: now n, not 1)
+                H_post_raw = F.linear(x_agg_for_pred, hc_theta_post[attn_idx])  # (B, S, n)
+                H_post = hc_alpha_post[attn_idx] * torch.tanh(H_post_raw).unsqueeze(-1) + hc_b_post[attn_idx]  # (B, S, n, 1)
+                
+                # H_res: predicts n*n weights for full mixing matrix (FIXED: now n*n, not n)
+                H_res_raw = F.linear(x_agg_for_pred, hc_theta_res[attn_idx])  # (B, S, n*n)
+                H_res_dynamic = hc_alpha_res[attn_idx] * torch.tanh(
+                    H_res_raw.view(bsz, seq_len, n_lanes, n_lanes)
+                )
+                H_res = H_res_dynamic + hc_b_res[attn_idx]  # (B, S, n, n)
 
                 # Aggregate
                 x_agg = (H_pre @ x_lanes).squeeze(-2)
@@ -1368,20 +1383,36 @@ class GPT(nn.Module):
                 attn_out = attn_out * self.hc_output_scale
 
                 # Expand + mix
-                x_expanded = H_post @ attn_out.unsqueeze(-2)
-                x_mixed = torch.einsum('bsnm,bsmd->bsnd', H_res, x_lanes)
+                x_expanded = H_post @ attn_out.unsqueeze(-2)  # (B, S, n, 1) @ (B, S, 1, D) -> (B, S, n, D)
+                x_mixed = torch.bmm(
+                    H_res.reshape(bsz * seq_len, n_lanes, n_lanes),
+                    x_lanes.reshape(bsz * seq_len, n_lanes, d_model),
+                ).reshape(bsz, seq_len, n_lanes, d_model)
                 x_lanes = x_mixed + x_expanded
 
             # === MLP HYPERCONNECTION ===
             mlp_idx = self.sublayer_to_mlp_hyper_idx[i]
+            bsz, seq_len, n_lanes, d_model = x_lanes.shape
 
             # H matrices for MLP sublayer
             x_tilde = norm(x_lanes)
-            H_pre = hc_alpha_pre[mlp_idx] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_pre[mlp_idx], x_tilde)) + hc_b_pre[mlp_idx]
+            x_agg_for_pred = x_tilde.sum(dim=2)  # (B, S, D) - aggregated for predictions
+            
+            # H_pre: predicts n weights for aggregation
+            H_pre_raw = (x_tilde * hc_theta_pre[mlp_idx]).sum(dim=-1)  # (B, S, n)
+            H_pre = hc_alpha_pre[mlp_idx] * torch.tanh(H_pre_raw) + hc_b_pre[mlp_idx]  # (B, S, 1, n)
             H_pre = H_pre.unsqueeze(-2)
-            H_post_raw = hc_alpha_post[mlp_idx] * torch.tanh(torch.einsum('od,bsd->bso', hc_theta_post[mlp_idx], x_tilde.sum(dim=2))).unsqueeze(-2)
-            H_post = H_post_raw + hc_b_post[mlp_idx]
-            H_res = hc_alpha_res[mlp_idx] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_res[mlp_idx], x_tilde).unsqueeze(-1).expand(-1, -1, -1, self.n_lanes)) + hc_b_res[mlp_idx]
+            
+            # H_post: predicts n weights for expansion (FIXED: now n, not 1)
+            H_post_raw = F.linear(x_agg_for_pred, hc_theta_post[mlp_idx])  # (B, S, n)
+            H_post = hc_alpha_post[mlp_idx] * torch.tanh(H_post_raw).unsqueeze(-1) + hc_b_post[mlp_idx]  # (B, S, n, 1)
+            
+            # H_res: predicts n*n weights for full mixing matrix (FIXED: now n*n, not n)
+            H_res_raw = F.linear(x_agg_for_pred, hc_theta_res[mlp_idx])  # (B, S, n*n)
+            H_res_dynamic = hc_alpha_res[mlp_idx] * torch.tanh(
+                H_res_raw.view(bsz, seq_len, n_lanes, n_lanes)
+            )
+            H_res = H_res_dynamic + hc_b_res[mlp_idx]  # (B, S, n, n)
 
             # Aggregate
             x_agg = (H_pre @ x_lanes).squeeze(-2)
@@ -1397,8 +1428,11 @@ class GPT(nn.Module):
             mlp_out = mlp_out * self.hc_output_scale
 
             # Expand + mix
-            x_expanded = H_post @ mlp_out.unsqueeze(-2)
-            x_mixed = torch.einsum('bsnm,bsmd->bsnd', H_res, x_lanes)
+            x_expanded = H_post @ mlp_out.unsqueeze(-2)  # (B, S, n, 1) @ (B, S, 1, D) -> (B, S, n, D)
+            x_mixed = torch.bmm(
+                H_res.reshape(bsz * seq_len, n_lanes, n_lanes),
+                x_lanes.reshape(bsz * seq_len, n_lanes, d_model),
+            ).reshape(bsz, seq_len, n_lanes, d_model)
             x_lanes = x_mixed + x_expanded
 
             # Skip IN (after all sublayers)
@@ -2031,6 +2065,24 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+        if os.environ.get("HC_LOG", "0") == "1":
+            with torch.no_grad():
+                theta_pre = model.hyper_theta_pre.float().abs().mean().item()
+                alpha_pre = model.hyper_alpha_pre.float().abs().mean().item()
+                b_pre = model.hyper_b_pre.float().mean().item()
+                theta_post = model.hyper_theta_post.float().abs().mean().item()
+                alpha_post = model.hyper_alpha_post.float().abs().mean().item()
+                b_post = model.hyper_b_post.float().mean().item()
+                theta_res = model.hyper_theta_res.float().abs().mean().item()
+                alpha_res = model.hyper_alpha_res.float().abs().mean().item()
+                b_res = model.hyper_b_res.float().mean().item()
+            print0(
+                "hc_stats "
+                f"theta_pre:{theta_pre:.3e} alpha_pre:{alpha_pre:.3e} b_pre:{b_pre:.3e} "
+                f"theta_post:{theta_post:.3e} alpha_post:{alpha_post:.3e} b_post:{b_post:.3e} "
+                f"theta_res:{theta_res:.3e} alpha_res:{alpha_res:.3e} b_res:{b_res:.3e}",
+                console=True,
+            )
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
