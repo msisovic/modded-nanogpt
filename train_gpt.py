@@ -1085,24 +1085,31 @@ class GPT(nn.Module):
         nn.init.zeros_(self.skip_gate.weight)
         self.skip_gate.weight.label = 'skip_gate'
 
-        # Hyperconnection parameter banks for dynamic lane mixing (stacked across layers)
+        # Identify which layers have attention/MLP (moved here for hyperconnection bank sizing)
+        # Attention is skipped in layer 6 by @YouJiacheng
+        self.attn_layer_indices = [i for i in range(num_layers) if i != 6]
+        # All layers have MLP (At 11 layers--dropped first layer @EmelyanenkoK)
+        self.mlp_layer_indices = list(range(num_layers))
+
+        # Hyperconnection parameter banks for dynamic lane mixing (stacked across sublayers)
         self.n_lanes = 4
         n = self.n_lanes
-        
+        num_sublayers = len(self.attn_layer_indices) + len(self.mlp_layer_indices)  # 10 + 11 = 21
+
         # H_pre: aggregate n lanes -> 1
-        self.hyper_theta_pre = nn.Parameter(torch.randn(num_layers, n, model_dim) * 0.02)
-        self.hyper_alpha_pre = nn.Parameter(torch.zeros(num_layers, 1, n))
-        self.hyper_b_pre = nn.Parameter(torch.zeros(num_layers, 1, n) + 1.0 / n)
-        
+        self.hyper_theta_pre = nn.Parameter(torch.randn(num_sublayers, n, model_dim) * 0.02)
+        self.hyper_alpha_pre = nn.Parameter(torch.zeros(num_sublayers, 1, n))
+        self.hyper_b_pre = nn.Parameter(torch.zeros(num_sublayers, 1, n) + 1.0 / n)
+
         # H_post: expand 1 -> n lanes
-        self.hyper_theta_post = nn.Parameter(torch.randn(num_layers, 1, model_dim) * 0.02)
-        self.hyper_alpha_post = nn.Parameter(torch.zeros(num_layers, n, 1))
-        self.hyper_b_post = nn.Parameter(torch.ones(num_layers, n, 1))
-        
+        self.hyper_theta_post = nn.Parameter(torch.randn(num_sublayers, 1, model_dim) * 0.02)
+        self.hyper_alpha_post = nn.Parameter(torch.zeros(num_sublayers, n, 1))
+        self.hyper_b_post = nn.Parameter(torch.ones(num_sublayers, n, 1))
+
         # H_res: mix n -> n lanes
-        self.hyper_theta_res = nn.Parameter(torch.randn(num_layers, n, model_dim) * 0.02)
-        self.hyper_alpha_res = nn.Parameter(torch.zeros(num_layers, n, n))
-        self.hyper_b_res = nn.Parameter(torch.eye(n).unsqueeze(0).expand(num_layers, -1, -1).clone())
+        self.hyper_theta_res = nn.Parameter(torch.randn(num_sublayers, n, model_dim) * 0.02)
+        self.hyper_alpha_res = nn.Parameter(torch.zeros(num_sublayers, n, n))
+        self.hyper_b_res = nn.Parameter(torch.eye(n).unsqueeze(0).expand(num_sublayers, -1, -1).clone())
         
         # Label hyperconnection banks
         self.hyper_theta_pre.label = 'hyper_theta_pre'
@@ -1132,18 +1139,16 @@ class GPT(nn.Module):
         # -----------------------------------
         # Parameter banks for sharded optimization, by @chrisjmccormick
 
-        # Identify which layers have attention/MLP
-        # Attention is skipped in layer 6 by @YouJiacheng
-        self.attn_layer_indices = [i for i in range(num_layers) if i != 6]
-        # All layers have MLP (At 11 layers--dropped first layer @EmelyanenkoK)
-        self.mlp_layer_indices = list(range(num_layers))
-
         hdim = num_heads * head_dim
         mlp_hdim = 4 * model_dim
 
         # Create index mappings: layer_idx -> bank_idx
         self.layer_to_attn_idx = {layer_idx: bank_idx for bank_idx, layer_idx in enumerate(self.attn_layer_indices)}
         self.layer_to_mlp_idx = {layer_idx: bank_idx for bank_idx, layer_idx in enumerate(self.mlp_layer_indices)}
+
+        # Hyperconnection sublayer indexing: attn sublayers are indices 0-9, mlp sublayers are indices 10-20
+        self.sublayer_to_attn_hyper_idx = {layer_idx: i for i, layer_idx in enumerate(self.attn_layer_indices)}
+        self.sublayer_to_mlp_hyper_idx = {layer_idx: len(self.attn_layer_indices) + i for i, layer_idx in enumerate(self.mlp_layer_indices)}
 
         # Attention bank: stores QKVO weights for all attention layers
         # merged QKVO weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
@@ -1312,56 +1317,78 @@ class GPT(nn.Module):
                 ve_gate_w=ve_gates[i]
             )
 
-            # 1. Compute H matrices from normalized lanes
-            x_tilde = norm(x_lanes)  # (B, S, n, d)
-
-            # H_pre: aggregate n lanes -> 1
-            H_pre = hc_alpha_pre[i] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_pre[i], x_tilde)) + hc_b_pre[i]
-            H_pre = H_pre.unsqueeze(-2)  # (B, S, 1, n)
-
-            # H_post: expand 1 -> n lanes
-            H_post_raw = hc_alpha_post[i] * torch.tanh(torch.einsum('od,bsd->bso', hc_theta_post[i], x_tilde.sum(dim=2))).unsqueeze(-2)
-            H_post = H_post_raw + hc_b_post[i]  # (B, S, n, 1)
-
-            # H_res: mix n -> n lanes
-            H_res = hc_alpha_res[i] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_res[i], x_tilde).unsqueeze(-1).expand(-1, -1, -1, self.n_lanes)) + hc_b_res[i]
-
-            # 2. Skip OUT (before aggregation, on lanes)
+            # Skip OUT (before first sublayer of this layer)
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
                 x_lanes = x_lanes + skip_gate_out.unsqueeze(-2) * skip_connections.pop()
 
-            # 3. Aggregate: (B, S, 1, n) @ (B, S, n, d) -> (B, S, 1, d) -> squeeze -> (B, S, d)
+            has_attn = i in self.layer_to_attn_idx
+            x0_bigram_applied = False
+
+            # === ATTENTION HYPERCONNECTION ===
+            if has_attn:
+                attn_idx = self.sublayer_to_attn_hyper_idx[i]
+
+                # H matrices for attention sublayer
+                x_tilde = norm(x_lanes)
+                H_pre = hc_alpha_pre[attn_idx] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_pre[attn_idx], x_tilde)) + hc_b_pre[attn_idx]
+                H_pre = H_pre.unsqueeze(-2)
+                H_post_raw = hc_alpha_post[attn_idx] * torch.tanh(torch.einsum('od,bsd->bso', hc_theta_post[attn_idx], x_tilde.sum(dim=2))).unsqueeze(-2)
+                H_post = H_post_raw + hc_b_post[attn_idx]
+                H_res = hc_alpha_res[attn_idx] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_res[attn_idx], x_tilde).unsqueeze(-1).expand(-1, -1, -1, self.n_lanes)) + hc_b_res[attn_idx]
+
+                # Aggregate
+                x_agg = (H_pre @ x_lanes).squeeze(-2)
+
+                # x0/bigram mixing (before first sublayer)
+                if i == 0:
+                    x_agg = (resid_lambdas[0] + x0_lambdas[0]) * x_agg + bigram_lambdas[0] * x0_bigram
+                else:
+                    x_agg = resid_lambdas[i] * x_agg + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
+                x0_bigram_applied = True
+
+                # Attention (call sublayer directly)
+                qkvo_w = attn_weights[self.layer_to_attn_idx[i]]
+                attn_out = self.blocks[i].attn(norm(x_agg), attn_args, qkvo_w)
+
+                # Expand + mix
+                x_expanded = H_post @ attn_out.unsqueeze(-2)
+                x_mixed = torch.einsum('bsnm,bsmd->bsnd', H_res, x_lanes)
+                x_lanes = x_mixed + x_expanded
+
+            # === MLP HYPERCONNECTION ===
+            mlp_idx = self.sublayer_to_mlp_hyper_idx[i]
+
+            # H matrices for MLP sublayer
+            x_tilde = norm(x_lanes)
+            H_pre = hc_alpha_pre[mlp_idx] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_pre[mlp_idx], x_tilde)) + hc_b_pre[mlp_idx]
+            H_pre = H_pre.unsqueeze(-2)
+            H_post_raw = hc_alpha_post[mlp_idx] * torch.tanh(torch.einsum('od,bsd->bso', hc_theta_post[mlp_idx], x_tilde.sum(dim=2))).unsqueeze(-2)
+            H_post = H_post_raw + hc_b_post[mlp_idx]
+            H_res = hc_alpha_res[mlp_idx] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_res[mlp_idx], x_tilde).unsqueeze(-1).expand(-1, -1, -1, self.n_lanes)) + hc_b_res[mlp_idx]
+
+            # Aggregate
             x_agg = (H_pre @ x_lanes).squeeze(-2)
 
-            # 4. Apply x0/bigram mixing (on aggregated signal)
-            if i == 0:
-                x_agg = (resid_lambdas[0] + x0_lambdas[0]) * x_agg + bigram_lambdas[0] * x0_bigram
-            else:
+            # x0/bigram mixing (only if attn didn't do it - i.e., layer 6)
+            if not x0_bigram_applied:
                 x_agg = resid_lambdas[i] * x_agg + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
 
-            # Get weights for this layer from banks
-            qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
-            c_fc = mlp_fcs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
-            c_proj = mlp_projs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
+            # MLP (call sublayer directly)
+            c_fc = mlp_fcs[self.layer_to_mlp_idx[i]]
+            c_proj = mlp_projs[self.layer_to_mlp_idx[i]]
+            mlp_out = self.blocks[i].mlp(norm(x_agg), c_fc, c_proj)
 
-            # 5. Pass through block (returns raw output, no internal residual)
-            layer_out = self.blocks[i](x_agg, attn_args, qkvo_w, c_fc, c_proj)
-
-            # 6. Expand back to lanes: (B, S, d) -> (B, S, 1, d) -> H_post @ ... -> (B, S, n, d)
-            x_expanded = H_post @ layer_out.unsqueeze(-2)  # (B, S, n, 1) @ (B, S, 1, d) -> (B, S, n, d)
-
-            # 7. Mix original lanes (residual path)
+            # Expand + mix
+            x_expanded = H_post @ mlp_out.unsqueeze(-2)
             x_mixed = torch.einsum('bsnm,bsmd->bsnd', H_res, x_lanes)
-
-            # 8. Combine
             x_lanes = x_mixed + x_expanded
 
-            # 9. Skip IN (after block processing, on lanes)
+            # Skip IN (after all sublayers)
             if i in skip_in:
                 skip_connections.append(x_lanes.clone())
 
-            # 10. Backout save
+            # Backout save
             if i == backout_layer:
                 x_backout = x_lanes.clone()
 
