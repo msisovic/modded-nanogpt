@@ -1097,19 +1097,31 @@ class GPT(nn.Module):
         num_sublayers = len(self.attn_layer_indices) + len(self.mlp_layer_indices)  # 10 + 11 = 21
 
         # H_pre: aggregate n lanes -> 1
-        self.hyper_theta_pre = nn.Parameter(torch.randn(num_sublayers, n, model_dim) * 0.02)
-        self.hyper_alpha_pre = nn.Parameter(torch.zeros(num_sublayers, 1, n) + 0.02)
-        self.hyper_b_pre = nn.Parameter(torch.zeros(num_sublayers, 1, n) + 1.0 / n)
+        self.hyper_theta_pre = nn.Parameter(torch.zeros(num_sublayers, n, model_dim))
+        self.hyper_alpha_pre = nn.Parameter(torch.zeros(num_sublayers, 1, n))
+        self.hyper_b_pre = nn.Parameter(torch.empty(num_sublayers, 1, n))
 
         # H_post: expand 1 -> n lanes
-        self.hyper_theta_post = nn.Parameter(torch.randn(num_sublayers, 1, model_dim) * 0.02)
-        self.hyper_alpha_post = nn.Parameter(torch.zeros(num_sublayers, n, 1) + 0.02)
-        self.hyper_b_post = nn.Parameter(torch.ones(num_sublayers, n, 1))
+        self.hyper_theta_post = nn.Parameter(torch.zeros(num_sublayers, 1, model_dim))
+        self.hyper_alpha_post = nn.Parameter(torch.zeros(num_sublayers, n, 1))
+        self.hyper_b_post = nn.Parameter(torch.empty(num_sublayers, n, 1))
 
         # H_res: mix n -> n lanes
-        self.hyper_theta_res = nn.Parameter(torch.randn(num_sublayers, n, model_dim) * 0.02)
-        self.hyper_alpha_res = nn.Parameter(torch.zeros(num_sublayers, n, n) + 0.02)
-        self.hyper_b_res = nn.Parameter(torch.eye(n).unsqueeze(0).expand(num_sublayers, -1, -1).clone())
+        self.hyper_theta_res = nn.Parameter(torch.zeros(num_sublayers, n, model_dim))
+        self.hyper_alpha_res = nn.Parameter(torch.zeros(num_sublayers, n, n))
+        self.hyper_b_res = nn.Parameter(torch.empty(num_sublayers, n, n))
+
+        # Static init to mimic a pre-norm residual block at step 0
+        with torch.no_grad():
+            self.hyper_b_pre.zero_()
+            if n > 1:
+                self.hyper_b_pre[:, 0, 1:] = 1.0
+            else:
+                self.hyper_b_pre[:, 0, 0] = 1.0
+            self.hyper_b_post.fill_(1.0)
+            base_eye = torch.eye(n)
+            base_shift = torch.roll(base_eye, shifts=1, dims=1)
+            self.hyper_b_res.copy_((base_eye + base_shift).unsqueeze(0).expand(num_sublayers, -1, -1))
         
         # Label hyperconnection banks
         self.hyper_theta_pre.label = 'hyper_theta_pre'
@@ -1121,6 +1133,9 @@ class GPT(nn.Module):
         self.hyper_theta_res.label = 'hyper_theta_res'
         self.hyper_alpha_res.label = 'hyper_alpha_res'
         self.hyper_b_res.label = 'hyper_b_res'
+
+        # Output scaling to keep post-sum variance stable with n lanes
+        self.hc_output_scale = self.n_lanes ** -0.5
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
@@ -1350,6 +1365,7 @@ class GPT(nn.Module):
                 # Attention (call sublayer directly)
                 qkvo_w = attn_weights[self.layer_to_attn_idx[i]]
                 attn_out = self.blocks[i].attn(norm(x_agg), attn_args, qkvo_w)
+                attn_out = attn_out * self.hc_output_scale
 
                 # Expand + mix
                 x_expanded = H_post @ attn_out.unsqueeze(-2)
@@ -1378,6 +1394,7 @@ class GPT(nn.Module):
             c_fc = mlp_fcs[self.layer_to_mlp_idx[i]]
             c_proj = mlp_projs[self.layer_to_mlp_idx[i]]
             mlp_out = self.blocks[i].mlp(norm(x_agg), c_fc, c_proj)
+            mlp_out = mlp_out * self.hc_output_scale
 
             # Expand + mix
             x_expanded = H_post @ mlp_out.unsqueeze(-2)
@@ -1699,14 +1716,14 @@ class TrainingManager():
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             # Hyperconnection parameters
-            "hyper_theta_pre":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
-            "hyper_alpha_pre":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_theta_pre":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
+            "hyper_alpha_pre":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
             "hyper_b_pre":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
-            "hyper_theta_post": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
-            "hyper_alpha_post": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_theta_post": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
+            "hyper_alpha_post": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
             "hyper_b_post":     {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
-            "hyper_theta_res":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
-            "hyper_alpha_res":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_theta_res":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
+            "hyper_alpha_res":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
             "hyper_b_res":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
         }
 
