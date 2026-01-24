@@ -1101,28 +1101,32 @@ class GPT(nn.Module):
         self.hyper_alpha_pre = nn.Parameter(torch.full((num_sublayers, 1, n), 0.01))
         self.hyper_b_pre = nn.Parameter(torch.zeros(num_sublayers, 1, n))
 
-        # H_post: expand 1 -> n lanes (predicts n weights - FIXED: was 1)
+        # H_post: expand 1 -> n lanes
         self.hyper_theta_post = nn.Parameter(torch.zeros(num_sublayers, n, model_dim))
         self.hyper_alpha_post = nn.Parameter(torch.full((num_sublayers, n, 1), 0.01))
         self.hyper_b_post = nn.Parameter(torch.zeros(num_sublayers, n, 1))
 
-        # H_res: mix n -> n lanes (predicts n*n weights - FIXED: was n)
+        # H_res: mix n -> n lanes
         self.hyper_theta_res = nn.Parameter(torch.zeros(num_sublayers, n * n, model_dim))
         self.hyper_alpha_res = nn.Parameter(torch.full((num_sublayers, n, n), 0.01))
         self.hyper_b_res = nn.Parameter(torch.zeros(num_sublayers, n, n))
+        
+        # Scale factor for F.linear to prevent gradient explosion
+        self.hc_linear_scale = model_dim ** -0.5
 
-        # Static init to PRECISELY mimic a pre-norm residual block at step 0
-        # Reference: Paper Equation 14 & Section 2.3
+        # Static init to precisely mimic a pre-norm residual block at step 0
         with torch.no_grad():
-            # H_pre (Aggregation): Select exactly ONE lane based on sublayer index (cycling)
+            # H_pre: select exactly one lane per sublayer
+            self.hyper_b_pre.zero_()
             for i in range(num_sublayers):
                 active_lane = i % n
                 self.hyper_b_pre[i, 0, active_lane] = 1.0
-            
-            # H_post (Expansion): Broadcast output to ALL lanes
+
+            # H_post: broadcast output to all lanes
             self.hyper_b_post.fill_(1.0)
-            
-            # H_res (Residual): Identity only (no shifting/mixing at start)
+
+            # H_res: identity only (no initial mixing)
+            self.hyper_b_res.zero_()
             self.hyper_b_res.copy_(torch.eye(n).unsqueeze(0).expand(num_sublayers, -1, -1))
         
         # Label hyperconnection banks
@@ -1263,7 +1267,6 @@ class GPT(nn.Module):
         backout_layer = 7
 
         # set lambdas
-        resid_lambdas = self.scalars[: 1 * self.num_layers]
         x0_lambdas = self.x0_lambdas
         sa_lambdas = self.scalars[1 * self.num_layers: 3 * self.num_layers].view(-1, 2)
         bigram_lambdas = self.scalars[3 * self.num_layers: 4 * self.num_layers]
@@ -1340,42 +1343,34 @@ class GPT(nn.Module):
                 x_lanes = x_lanes + skip_gate_out.unsqueeze(-2) * skip_connections.pop()
 
             has_attn = i in self.layer_to_attn_idx
-            x0_bigram_applied = False
 
             # === ATTENTION HYPERCONNECTION ===
             if has_attn:
                 attn_idx = self.sublayer_to_attn_hyper_idx[i]
                 bsz, seq_len, n_lanes, d_model = x_lanes.shape
 
-                # H matrices for attention sublayer
+                # HC-native skip: overwrite Lane 0 with x0+bigram (H_pre routes dynamically)
+                x_skip = x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
+                x_lanes[:, :, 0, :] = x_skip
+
+                # H matrices for attention sublayer (paper-faithful with scaling)
                 x_tilde = norm(x_lanes)
-                x_agg_for_pred = x_tilde.sum(dim=2)  # (B, S, D) - aggregated for predictions
+                x_agg = x_tilde.mean(dim=2)  # Use MEAN for stable scale
                 
-                # H_pre: predicts n weights for aggregation
-                H_pre_raw = (x_tilde * hc_theta_pre[attn_idx]).sum(dim=-1)  # (B, S, n)
-                H_pre = hc_alpha_pre[attn_idx] * torch.tanh(H_pre_raw) + hc_b_pre[attn_idx]  # (B, S, 1, n)
+                # H_pre: per-lane dot product (unchanged)
+                H_pre = hc_alpha_pre[attn_idx] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_pre[attn_idx], x_tilde)) + hc_b_pre[attn_idx]
                 H_pre = H_pre.unsqueeze(-2)
                 
-                # H_post: predicts n weights for expansion (FIXED: now n, not 1)
-                H_post_raw = F.linear(x_agg_for_pred, hc_theta_post[attn_idx])  # (B, S, n)
-                H_post = hc_alpha_post[attn_idx] * torch.tanh(H_post_raw).unsqueeze(-1) + hc_b_post[attn_idx]  # (B, S, n, 1)
+                # H_post: n outputs via F.linear
+                H_post_raw = F.linear(x_agg, hc_theta_post[attn_idx]) * self.hc_linear_scale
+                H_post = hc_alpha_post[attn_idx] * torch.tanh(H_post_raw).unsqueeze(-1) + hc_b_post[attn_idx]
                 
-                # H_res: predicts n*n weights for full mixing matrix (FIXED: now n*n, not n)
-                H_res_raw = F.linear(x_agg_for_pred, hc_theta_res[attn_idx])  # (B, S, n*n)
-                H_res_dynamic = hc_alpha_res[attn_idx] * torch.tanh(
-                    H_res_raw.view(bsz, seq_len, n_lanes, n_lanes)
-                )
-                H_res = H_res_dynamic + hc_b_res[attn_idx]  # (B, S, n, n)
+                # H_res: n*n outputs via F.linear
+                H_res_raw = F.linear(x_agg, hc_theta_res[attn_idx]) * self.hc_linear_scale
+                H_res = hc_alpha_res[attn_idx] * torch.tanh(H_res_raw.view(bsz, seq_len, n_lanes, n_lanes)) + hc_b_res[attn_idx]
 
-                # Aggregate
+                # Aggregate (H_pre routes dynamically to Lane 0 for skip connection)
                 x_agg = (H_pre @ x_lanes).squeeze(-2)
-
-                # x0/bigram mixing (before first sublayer)
-                if i == 0:
-                    x_agg = (resid_lambdas[0] + x0_lambdas[0]) * x_agg + bigram_lambdas[0] * x0_bigram
-                else:
-                    x_agg = resid_lambdas[i] * x_agg + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
-                x0_bigram_applied = True
 
                 # Attention (call sublayer directly)
                 qkvo_w = attn_weights[self.layer_to_attn_idx[i]]
@@ -1384,42 +1379,35 @@ class GPT(nn.Module):
 
                 # Expand + mix
                 x_expanded = H_post @ attn_out.unsqueeze(-2)  # (B, S, n, 1) @ (B, S, 1, D) -> (B, S, n, D)
-                x_mixed = torch.bmm(
-                    H_res.reshape(bsz * seq_len, n_lanes, n_lanes),
-                    x_lanes.reshape(bsz * seq_len, n_lanes, d_model),
-                ).reshape(bsz, seq_len, n_lanes, d_model)
+                x_mixed = torch.einsum('bsnm,bsmd->bsnd', H_res, x_lanes)
                 x_lanes = x_mixed + x_expanded
 
             # === MLP HYPERCONNECTION ===
             mlp_idx = self.sublayer_to_mlp_hyper_idx[i]
             bsz, seq_len, n_lanes, d_model = x_lanes.shape
 
+            # HC-native skip: overwrite Lane 0 with x0+bigram (H_pre routes dynamically)
+            x_skip = x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
+            x_lanes[:, :, 0, :] = x_skip
+
             # H matrices for MLP sublayer
             x_tilde = norm(x_lanes)
-            x_agg_for_pred = x_tilde.sum(dim=2)  # (B, S, D) - aggregated for predictions
+            x_agg = x_tilde.mean(dim=2)  # Use MEAN for stable scale
             
-            # H_pre: predicts n weights for aggregation
-            H_pre_raw = (x_tilde * hc_theta_pre[mlp_idx]).sum(dim=-1)  # (B, S, n)
-            H_pre = hc_alpha_pre[mlp_idx] * torch.tanh(H_pre_raw) + hc_b_pre[mlp_idx]  # (B, S, 1, n)
+            # H_pre: per-lane dot product
+            H_pre = hc_alpha_pre[mlp_idx] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_pre[mlp_idx], x_tilde)) + hc_b_pre[mlp_idx]
             H_pre = H_pre.unsqueeze(-2)
             
-            # H_post: predicts n weights for expansion (FIXED: now n, not 1)
-            H_post_raw = F.linear(x_agg_for_pred, hc_theta_post[mlp_idx])  # (B, S, n)
-            H_post = hc_alpha_post[mlp_idx] * torch.tanh(H_post_raw).unsqueeze(-1) + hc_b_post[mlp_idx]  # (B, S, n, 1)
+            # H_post: n outputs via F.linear
+            H_post_raw = F.linear(x_agg, hc_theta_post[mlp_idx]) * self.hc_linear_scale
+            H_post = hc_alpha_post[mlp_idx] * torch.tanh(H_post_raw).unsqueeze(-1) + hc_b_post[mlp_idx]
             
-            # H_res: predicts n*n weights for full mixing matrix (FIXED: now n*n, not n)
-            H_res_raw = F.linear(x_agg_for_pred, hc_theta_res[mlp_idx])  # (B, S, n*n)
-            H_res_dynamic = hc_alpha_res[mlp_idx] * torch.tanh(
-                H_res_raw.view(bsz, seq_len, n_lanes, n_lanes)
-            )
-            H_res = H_res_dynamic + hc_b_res[mlp_idx]  # (B, S, n, n)
+            # H_res: n*n outputs via F.linear
+            H_res_raw = F.linear(x_agg, hc_theta_res[mlp_idx]) * self.hc_linear_scale
+            H_res = hc_alpha_res[mlp_idx] * torch.tanh(H_res_raw.view(bsz, seq_len, n_lanes, n_lanes)) + hc_b_res[mlp_idx]
 
-            # Aggregate
+            # Aggregate (H_pre routes dynamically to Lane 0 for skip connection)
             x_agg = (H_pre @ x_lanes).squeeze(-2)
-
-            # x0/bigram mixing (only if attn didn't do it - i.e., layer 6)
-            if not x0_bigram_applied:
-                x_agg = resid_lambdas[i] * x_agg + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
 
             # MLP (call sublayer directly)
             c_fc = mlp_fcs[self.layer_to_mlp_idx[i]]
@@ -1429,10 +1417,7 @@ class GPT(nn.Module):
 
             # Expand + mix
             x_expanded = H_post @ mlp_out.unsqueeze(-2)  # (B, S, n, 1) @ (B, S, 1, D) -> (B, S, n, D)
-            x_mixed = torch.bmm(
-                H_res.reshape(bsz * seq_len, n_lanes, n_lanes),
-                x_lanes.reshape(bsz * seq_len, n_lanes, d_model),
-            ).reshape(bsz, seq_len, n_lanes, d_model)
+            x_mixed = torch.einsum('bsnm,bsmd->bsnd', H_res, x_lanes)
             x_lanes = x_mixed + x_expanded
 
             # Skip IN (after all sublayers)
@@ -1448,7 +1433,7 @@ class GPT(nn.Module):
 
         # Final aggregation: sum across lanes (B, S, n, d) -> (B, S, d)
         x = x_lanes.sum(dim=2)
-
+        
         x = norm(x)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
@@ -1994,7 +1979,10 @@ model.hyper_b_res.data = model.hyper_b_res.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+if os.environ.get("DISABLE_TORCH_COMPILE", "0") == "1":
+    print0("torch.compile DISABLED via DISABLE_TORCH_COMPILE=1", console=True)
+else:
+    model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
 ########################################
