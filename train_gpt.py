@@ -781,6 +781,97 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 
+# -----------------------------------------------------------------------------
+# Fused Hyperconnection Helper Functions
+# These are compiled separately to help torch.compile optimize them better
+
+@torch.compile(fullgraph=True, dynamic=False)
+def hyperconnection_pre(x_lanes: Tensor, x_skip: Tensor,
+                        theta_pre: Tensor, alpha_pre: Tensor, b_pre: Tensor,
+                        theta_post_res: Tensor, alpha_post: Tensor, b_post: Tensor,
+                        alpha_res: Tensor, b_res: Tensor,
+                        n_lanes: int, hc_linear_scale: float) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    Pre-sublayer hyperconnection: computes lane aggregation and H matrices.
+    
+    Args:
+        x_lanes: (B, S, n, d) lane activations
+        x_skip: (B, S, d) skip connection to inject into lane 0
+        theta_pre: (n, d) H_pre theta
+        alpha_pre, b_pre: H_pre scale and bias
+        theta_post_res: (n + n*n, d) combined theta for H_post and H_res
+        alpha_post, b_post: H_post scale and bias  
+        alpha_res, b_res: H_res scale and bias
+        n_lanes: number of lanes
+        hc_linear_scale: scale factor for linear outputs
+        
+    Returns:
+        x_agg: (B, S, d) aggregated input for sublayer
+        H_post: (B, S, n, 1) expansion matrix
+        H_res: (B, S, n, n) residual mixing matrix
+    """
+    bsz, seq_len = x_lanes.shape[:2]
+    
+    # Inject skip connection into lane 0
+    x_lanes_modified = x_lanes.clone()
+    x_lanes_modified[:, :, 0, :] = x_skip
+    
+    # Normalize lanes
+    x_tilde = F.rms_norm(x_lanes_modified, (x_lanes_modified.size(-1),))
+    x_mean = x_tilde.mean(dim=2)  # (B, S, d)
+    
+    # H_pre: broadcasted multiply + sum (replaces einsum 'nd,bsnd->bsn')
+    dot_products = (x_tilde * theta_pre).sum(dim=-1)  # (B, S, n)
+    H_pre = alpha_pre * torch.tanh(dot_products) + b_pre  # (1, n) broadcast
+    H_pre = H_pre.unsqueeze(-2)  # (B, S, 1, n)
+    
+    # Combined linear for H_post and H_res (single matmul instead of two)
+    combined = F.linear(x_mean, theta_post_res) * hc_linear_scale  # (B, S, n + n*n)
+    H_post_raw = combined[..., :n_lanes]  # (B, S, n)
+    H_res_raw = combined[..., n_lanes:]   # (B, S, n*n)
+    
+    H_post = alpha_post * torch.tanh(H_post_raw).unsqueeze(-1) + b_post  # (B, S, n, 1)
+    H_res = alpha_res * torch.tanh(H_res_raw.view(bsz, seq_len, n_lanes, n_lanes)) + b_res  # (B, S, n, n)
+    
+    # Aggregate lanes: (B, S, 1, n) @ (B, S, n, d) -> (B, S, 1, d) -> (B, S, d)
+    x_agg = torch.matmul(H_pre, x_lanes_modified).squeeze(-2)
+    
+    return x_agg, H_post, H_res
+
+
+@torch.compile(fullgraph=True, dynamic=False)
+def hyperconnection_post(sublayer_out: Tensor, H_post: Tensor, H_res: Tensor, 
+                         x_lanes: Tensor, x_skip: Tensor, hc_output_scale: float) -> Tensor:
+    """
+    Post-sublayer hyperconnection: expands output and mixes with residual lanes.
+    
+    Args:
+        sublayer_out: (B, S, d) output from attention/MLP
+        H_post: (B, S, n, 1) expansion matrix
+        H_res: (B, S, n, n) residual mixing matrix
+        x_lanes: (B, S, n, d) current lane activations
+        x_skip: (B, S, d) skip connection that was injected into lane 0
+        hc_output_scale: scale factor for sublayer output
+        
+    Returns:
+        x_lanes_new: (B, S, n, d) updated lane activations
+    """
+    # Reconstruct the lanes with skip connection for mixing
+    x_lanes_for_mix = x_lanes.clone()
+    x_lanes_for_mix[:, :, 0, :] = x_skip
+    
+    # Scale sublayer output
+    scaled_out = sublayer_out * hc_output_scale
+    
+    # Expand: (B, S, n, 1) @ (B, S, 1, d) -> (B, S, n, d)
+    x_expanded = torch.matmul(H_post, scaled_out.unsqueeze(-2))
+    
+    # Mix residual lanes: (B, S, n, n) @ (B, S, n, d) -> (B, S, n, d)
+    x_mixed = torch.matmul(H_res, x_lanes_for_mix)
+    
+    return x_mixed + x_expanded
+
+
 class CastedLinearT(nn.Module):
     """
     Linear layer with transposed weight storage (in_features, out_features) which
@@ -1101,15 +1192,17 @@ class GPT(nn.Module):
         self.hyper_alpha_pre = nn.Parameter(torch.full((num_sublayers, 1, n), 0.01))
         self.hyper_b_pre = nn.Parameter(torch.zeros(num_sublayers, 1, n))
 
-        # H_post: expand 1 -> n lanes
-        self.hyper_theta_post = nn.Parameter(torch.zeros(num_sublayers, n, model_dim))
+        # H_post: expand 1 -> n lanes (theta combined with H_res below)
         self.hyper_alpha_post = nn.Parameter(torch.full((num_sublayers, n, 1), 0.01))
         self.hyper_b_post = nn.Parameter(torch.zeros(num_sublayers, n, 1))
 
-        # H_res: mix n -> n lanes
-        self.hyper_theta_res = nn.Parameter(torch.zeros(num_sublayers, n * n, model_dim))
+        # H_res: mix n -> n lanes (theta combined with H_post below)
         self.hyper_alpha_res = nn.Parameter(torch.full((num_sublayers, n, n), 0.01))
         self.hyper_b_res = nn.Parameter(torch.zeros(num_sublayers, n, n))
+        
+        # Combined theta for batched H_post + H_res linear (optimization: single linear instead of two)
+        # Shape: (num_sublayers, n + n*n, model_dim) = (21, 20, 768)
+        self.hyper_theta_post_res = nn.Parameter(torch.zeros(num_sublayers, n + n * n, model_dim))
         
         # Scale factor for F.linear to prevent gradient explosion
         self.hc_linear_scale = model_dim ** -0.5
@@ -1133,12 +1226,11 @@ class GPT(nn.Module):
         self.hyper_theta_pre.label = 'hyper_theta_pre'
         self.hyper_alpha_pre.label = 'hyper_alpha_pre'
         self.hyper_b_pre.label = 'hyper_b_pre'
-        self.hyper_theta_post.label = 'hyper_theta_post'
         self.hyper_alpha_post.label = 'hyper_alpha_post'
         self.hyper_b_post.label = 'hyper_b_post'
-        self.hyper_theta_res.label = 'hyper_theta_res'
         self.hyper_alpha_res.label = 'hyper_alpha_res'
         self.hyper_b_res.label = 'hyper_b_res'
+        self.hyper_theta_post_res.label = 'hyper_theta_post_res'
 
         # Output scaling to keep post-sum variance stable with n lanes
         self.hc_output_scale = self.n_lanes ** -0.5
@@ -1313,16 +1405,7 @@ class GPT(nn.Module):
         mlp_fcs = self.mlp_bank[:, 0, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
         mlp_projs = self.mlp_bank[:, 1, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
         
-        # unbind hyperconnection banks
-        hc_theta_pre = self.hyper_theta_pre.unbind(0)
-        hc_alpha_pre = self.hyper_alpha_pre.unbind(0)
-        hc_b_pre = self.hyper_b_pre.unbind(0)
-        hc_theta_post = self.hyper_theta_post.unbind(0)
-        hc_alpha_post = self.hyper_alpha_post.unbind(0)
-        hc_b_post = self.hyper_b_post.unbind(0)
-        hc_theta_res = self.hyper_theta_res.unbind(0)
-        hc_alpha_res = self.hyper_alpha_res.unbind(0)
-        hc_b_res = self.hyper_b_res.unbind(0)
+        # Hyperconnection parameters - use direct indexing (no unbind)
 
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
@@ -1347,78 +1430,62 @@ class GPT(nn.Module):
             # === ATTENTION HYPERCONNECTION ===
             if has_attn:
                 attn_idx = self.sublayer_to_attn_hyper_idx[i]
-                bsz, seq_len, n_lanes, d_model = x_lanes.shape
 
-                # HC-native skip: overwrite Lane 0 with x0+bigram (H_pre routes dynamically)
+                # Compute skip connection for this layer
                 x_skip = x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
-                x_lanes[:, :, 0, :] = x_skip
 
-                # H matrices for attention sublayer (paper-faithful with scaling)
-                x_tilde = norm(x_lanes)
-                x_agg = x_tilde.mean(dim=2)  # Use MEAN for stable scale
-                
-                # H_pre: per-lane dot product (unchanged)
-                H_pre = hc_alpha_pre[attn_idx] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_pre[attn_idx], x_tilde)) + hc_b_pre[attn_idx]
-                H_pre = H_pre.unsqueeze(-2)
-                
-                # H_post: n outputs via F.linear
-                H_post_raw = F.linear(x_agg, hc_theta_post[attn_idx]) * self.hc_linear_scale
-                H_post = hc_alpha_post[attn_idx] * torch.tanh(H_post_raw).unsqueeze(-1) + hc_b_post[attn_idx]
-                
-                # H_res: n*n outputs via F.linear
-                H_res_raw = F.linear(x_agg, hc_theta_res[attn_idx]) * self.hc_linear_scale
-                H_res = hc_alpha_res[attn_idx] * torch.tanh(H_res_raw.view(bsz, seq_len, n_lanes, n_lanes)) + hc_b_res[attn_idx]
-
-                # Aggregate (H_pre routes dynamically to Lane 0 for skip connection)
-                x_agg = (H_pre @ x_lanes).squeeze(-2)
+                # Pre-sublayer: aggregate lanes and compute H matrices
+                x_agg, H_post, H_res = hyperconnection_pre(
+                    x_lanes, x_skip,
+                    self.hyper_theta_pre[attn_idx],
+                    self.hyper_alpha_pre[attn_idx],
+                    self.hyper_b_pre[attn_idx],
+                    self.hyper_theta_post_res[attn_idx],
+                    self.hyper_alpha_post[attn_idx],
+                    self.hyper_b_post[attn_idx],
+                    self.hyper_alpha_res[attn_idx],
+                    self.hyper_b_res[attn_idx],
+                    self.n_lanes, self.hc_linear_scale
+                )
 
                 # Attention (call sublayer directly)
                 qkvo_w = attn_weights[self.layer_to_attn_idx[i]]
                 attn_out = self.blocks[i].attn(norm(x_agg), attn_args, qkvo_w)
-                attn_out = attn_out * self.hc_output_scale
 
-                # Expand + mix
-                x_expanded = H_post @ attn_out.unsqueeze(-2)  # (B, S, n, 1) @ (B, S, 1, D) -> (B, S, n, D)
-                x_mixed = torch.einsum('bsnm,bsmd->bsnd', H_res, x_lanes)
-                x_lanes = x_mixed + x_expanded
+                # Post-sublayer: expand and mix
+                x_lanes = hyperconnection_post(
+                    attn_out, H_post, H_res, x_lanes, x_skip, self.hc_output_scale
+                )
 
             # === MLP HYPERCONNECTION ===
             mlp_idx = self.sublayer_to_mlp_hyper_idx[i]
-            bsz, seq_len, n_lanes, d_model = x_lanes.shape
 
-            # HC-native skip: overwrite Lane 0 with x0+bigram (H_pre routes dynamically)
-            x_skip = x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
-            x_lanes[:, :, 0, :] = x_skip
+            # Compute skip connection for this layer
+            x_skip_mlp = x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
 
-            # H matrices for MLP sublayer
-            x_tilde = norm(x_lanes)
-            x_agg = x_tilde.mean(dim=2)  # Use MEAN for stable scale
-            
-            # H_pre: per-lane dot product
-            H_pre = hc_alpha_pre[mlp_idx] * torch.tanh(torch.einsum('nd,bsnd->bsn', hc_theta_pre[mlp_idx], x_tilde)) + hc_b_pre[mlp_idx]
-            H_pre = H_pre.unsqueeze(-2)
-            
-            # H_post: n outputs via F.linear
-            H_post_raw = F.linear(x_agg, hc_theta_post[mlp_idx]) * self.hc_linear_scale
-            H_post = hc_alpha_post[mlp_idx] * torch.tanh(H_post_raw).unsqueeze(-1) + hc_b_post[mlp_idx]
-            
-            # H_res: n*n outputs via F.linear
-            H_res_raw = F.linear(x_agg, hc_theta_res[mlp_idx]) * self.hc_linear_scale
-            H_res = hc_alpha_res[mlp_idx] * torch.tanh(H_res_raw.view(bsz, seq_len, n_lanes, n_lanes)) + hc_b_res[mlp_idx]
-
-            # Aggregate (H_pre routes dynamically to Lane 0 for skip connection)
-            x_agg = (H_pre @ x_lanes).squeeze(-2)
+            # Pre-sublayer: aggregate lanes and compute H matrices
+            x_agg, H_post, H_res = hyperconnection_pre(
+                x_lanes, x_skip_mlp,
+                self.hyper_theta_pre[mlp_idx],
+                self.hyper_alpha_pre[mlp_idx],
+                self.hyper_b_pre[mlp_idx],
+                self.hyper_theta_post_res[mlp_idx],
+                self.hyper_alpha_post[mlp_idx],
+                self.hyper_b_post[mlp_idx],
+                self.hyper_alpha_res[mlp_idx],
+                self.hyper_b_res[mlp_idx],
+                self.n_lanes, self.hc_linear_scale
+            )
 
             # MLP (call sublayer directly)
             c_fc = mlp_fcs[self.layer_to_mlp_idx[i]]
             c_proj = mlp_projs[self.layer_to_mlp_idx[i]]
             mlp_out = self.blocks[i].mlp(norm(x_agg), c_fc, c_proj)
-            mlp_out = mlp_out * self.hc_output_scale
 
-            # Expand + mix
-            x_expanded = H_post @ mlp_out.unsqueeze(-2)  # (B, S, n, 1) @ (B, S, 1, D) -> (B, S, n, D)
-            x_mixed = torch.einsum('bsnm,bsmd->bsnd', H_res, x_lanes)
-            x_lanes = x_mixed + x_expanded
+            # Post-sublayer: expand and mix
+            x_lanes = hyperconnection_post(
+                mlp_out, H_post, H_res, x_lanes, x_skip_mlp, self.hc_output_scale
+            )
 
             # Skip IN (after all sublayers)
             if i in skip_in:
@@ -1735,15 +1802,14 @@ class TrainingManager():
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             # Hyperconnection parameters
-            "hyper_theta_pre":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
-            "hyper_alpha_pre":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
-            "hyper_b_pre":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
-            "hyper_theta_post": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
-            "hyper_alpha_post": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
-            "hyper_b_post":     {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
-            "hyper_theta_res":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
-            "hyper_alpha_res":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
-            "hyper_b_res":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_theta_pre":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
+            "hyper_alpha_pre":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
+            "hyper_b_pre":          {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_alpha_post":     {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
+            "hyper_b_post":         {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_alpha_res":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
+            "hyper_b_res":          {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 0.0},
+            "hyper_theta_post_res": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 2.0, "wd_mul": 1.0},
         }
 
         # - Process smaller/faster params first while large reduces complete
@@ -1751,8 +1817,9 @@ class TrainingManager():
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
             "hyper_theta_pre", "hyper_alpha_pre", "hyper_b_pre",      # Hyperconnection params (small)
-            "hyper_theta_post", "hyper_alpha_post", "hyper_b_post",
-            "hyper_theta_res", "hyper_alpha_res", "hyper_b_res",
+            "hyper_alpha_post", "hyper_b_post",
+            "hyper_alpha_res", "hyper_b_res",
+            "hyper_theta_post_res",  # Combined theta for batched H_post + H_res linear
             "ve0", "ve1", "ve2", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
@@ -1970,12 +2037,11 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 model.hyper_theta_pre.data = model.hyper_theta_pre.data.bfloat16()
 model.hyper_alpha_pre.data = model.hyper_alpha_pre.data.bfloat16()
 model.hyper_b_pre.data = model.hyper_b_pre.data.bfloat16()
-model.hyper_theta_post.data = model.hyper_theta_post.data.bfloat16()
 model.hyper_alpha_post.data = model.hyper_alpha_post.data.bfloat16()
 model.hyper_b_post.data = model.hyper_b_post.data.bfloat16()
-model.hyper_theta_res.data = model.hyper_theta_res.data.bfloat16()
 model.hyper_alpha_res.data = model.hyper_alpha_res.data.bfloat16()
 model.hyper_b_res.data = model.hyper_b_res.data.bfloat16()
+model.hyper_theta_post_res.data = model.hyper_theta_post_res.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
@@ -2058,17 +2124,16 @@ for step in range(train_steps + 1):
                 theta_pre = model.hyper_theta_pre.float().abs().mean().item()
                 alpha_pre = model.hyper_alpha_pre.float().abs().mean().item()
                 b_pre = model.hyper_b_pre.float().mean().item()
-                theta_post = model.hyper_theta_post.float().abs().mean().item()
+                theta_post_res = model.hyper_theta_post_res.float().abs().mean().item()
                 alpha_post = model.hyper_alpha_post.float().abs().mean().item()
                 b_post = model.hyper_b_post.float().mean().item()
-                theta_res = model.hyper_theta_res.float().abs().mean().item()
                 alpha_res = model.hyper_alpha_res.float().abs().mean().item()
                 b_res = model.hyper_b_res.float().mean().item()
             print0(
                 "hc_stats "
                 f"theta_pre:{theta_pre:.3e} alpha_pre:{alpha_pre:.3e} b_pre:{b_pre:.3e} "
-                f"theta_post:{theta_post:.3e} alpha_post:{alpha_post:.3e} b_post:{b_post:.3e} "
-                f"theta_res:{theta_res:.3e} alpha_res:{alpha_res:.3e} b_res:{b_res:.3e}",
+                f"theta_post_res:{theta_post_res:.3e} alpha_post:{alpha_post:.3e} b_post:{b_post:.3e} "
+                f"alpha_res:{alpha_res:.3e} b_res:{b_res:.3e}",
                 console=True,
             )
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
