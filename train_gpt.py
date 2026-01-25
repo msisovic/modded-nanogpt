@@ -1177,7 +1177,7 @@ class GPT(nn.Module):
         nn.init.zeros_(self.bigram_embed.weight)
 
         # Static Hyper-Connections with Virtual Skip Lanes
-        self.n_lanes = 2
+        self.n_lanes = 4
         n_sublayers = 2 * num_layers  # attention + MLP per layer
 
         # hyper_w_res: (2*layers, n_lanes, n_lanes + 2) - mixes 4 inputs (2 lanes + x0 + bigram) -> 2 lanes
@@ -1185,7 +1185,7 @@ class GPT(nn.Module):
         hyper_w_res = torch.zeros(n_sublayers, self.n_lanes, self.n_lanes + 2)
         hyper_w_res[:, :, :self.n_lanes] = 1.1 * torch.eye(self.n_lanes)  # identity for lane mixing
         self.hyper_w_res = nn.Parameter(hyper_w_res)
-        self.hyper_w_res.label = 'hyper'
+        self.hyper_w_res.label = 'hyper_res'
 
         # hyper_w_pre: (2*layers, 1, n_lanes + 2) - aggregates 4 inputs -> 1 layer input
         # Init: select lane i%n_lanes, with small peek bias (0.1) for x0 and bigram
@@ -1195,13 +1195,13 @@ class GPT(nn.Module):
             hyper_w_pre[i, 0, 2] = 0.1  # small peek at x0
             hyper_w_pre[i, 0, 3] = 0.1  # small peek at bigram
         self.hyper_w_pre = nn.Parameter(hyper_w_pre)
-        self.hyper_w_pre.label = 'hyper'
+        self.hyper_w_pre.label = 'hyper_pre'
 
         # hyper_w_post: (2*layers, n_lanes, 1) - broadcasts 1 layer output -> 2 lanes
         # Init: 1.0 / sqrt(2)
         hyper_w_post = (1.0 / (self.n_lanes ** 0.5)) * torch.ones(n_sublayers, self.n_lanes, 1)
         self.hyper_w_post = nn.Parameter(hyper_w_post)
-        self.hyper_w_post.label = 'hyper'
+        self.hyper_w_post.label = 'hyper_post'
 
         pad = (-num_layers * 2 - 3) % dist.get_world_size()  # updated: 2*num_layers (SA lambdas only)
         self.scalars = nn.Parameter(
@@ -1672,7 +1672,9 @@ class TrainingManager():
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
-            "hyper":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99]},
+            "hyper_res":      {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99]},
+            "hyper_pre":      {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99]},
+            "hyper_post":     {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99]},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
@@ -1680,7 +1682,7 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "hyper",  # Small, fast
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "hyper_res", "hyper_pre", "hyper_post",  # Small, fast
             "ve0", "ve1", "ve2", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
