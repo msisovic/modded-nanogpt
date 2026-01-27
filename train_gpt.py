@@ -1312,24 +1312,24 @@ class GPT(nn.Module):
                 idx = 2 * i
 
                 # 1. PRE-MIX (n_lanes + 2 inputs -> 1 agg)
-                w_pre = hyper_w_pre[idx].squeeze(0)  # (n_lanes + 2,)
-                w_pre_lanes = w_pre[:self.n_lanes].view(1, 1, self.n_lanes, 1)  # broadcast over (B, S, n_lanes, D)
-                x_agg = (x_lanes * w_pre_lanes).sum(dim=2)  # sum over lanes
+                w_pre = hyper_w_pre[idx].squeeze(0)
+                x_agg = sum(x_lanes[:, :, l] * w_pre[l] for l in range(self.n_lanes))
                 x_agg = x_agg + x0 * w_pre[self.n_lanes] + x0_bigram * w_pre[self.n_lanes + 1]
 
                 # 2. RUN ATTENTION (call attn directly, returns projection only)
                 h = block.attn(norm(x_agg), attn_args, qkvo_w)
 
                 # 3. RESIDUAL UPDATE & POST-MIX
-                w_res = hyper_w_res[idx]  # (n_lanes, n_lanes + 2)
-                w_post = hyper_w_post[idx]  # (n_lanes, 1)
+                w_res = hyper_w_res[idx]
+                w_post = hyper_w_post[idx]
 
-                # Dynamic lane mixing via einsum
-                lanes_mixed = torch.einsum('bsld,ol->bsod', x_lanes, w_res[:, :self.n_lanes])
-                x0_contrib = x0.unsqueeze(2) * w_res[:, self.n_lanes].view(1, 1, self.n_lanes, 1)
-                xb_contrib = x0_bigram.unsqueeze(2) * w_res[:, self.n_lanes + 1].view(1, 1, self.n_lanes, 1)
-                h_contrib = h.unsqueeze(2) * w_post[:, 0].view(1, 1, self.n_lanes, 1)
-                x_lanes = lanes_mixed + x0_contrib + xb_contrib + h_contrib
+                new_lanes = []
+                for o in range(self.n_lanes):
+                    lane_o = sum(x_lanes[:, :, l] * w_res[o, l] for l in range(self.n_lanes))
+                    lane_o = lane_o + x0 * w_res[o, self.n_lanes] + x0_bigram * w_res[o, self.n_lanes + 1]
+                    lane_o = lane_o + h * w_post[o, 0]
+                    new_lanes.append(lane_o)
+                x_lanes = torch.stack(new_lanes, dim=2)
 
             # Skip-in connection (after attention sublayer)
             if i in skip_in:
@@ -1342,30 +1342,30 @@ class GPT(nn.Module):
                 idx = 2 * i + 1
 
                 # 1. PRE-MIX (n_lanes + 2 inputs -> 1 agg)
-                w_pre = hyper_w_pre[idx].squeeze(0)  # (n_lanes + 2,)
-                w_pre_lanes = w_pre[:self.n_lanes].view(1, 1, self.n_lanes, 1)  # broadcast over (B, S, n_lanes, D)
-                x_agg = (x_lanes * w_pre_lanes).sum(dim=2)  # sum over lanes
+                w_pre = hyper_w_pre[idx].squeeze(0)
+                x_agg = sum(x_lanes[:, :, l] * w_pre[l] for l in range(self.n_lanes))
                 x_agg = x_agg + x0 * w_pre[self.n_lanes] + x0_bigram * w_pre[self.n_lanes + 1]
 
                 # 2. RUN MLP
                 h = block.mlp(norm(x_agg), c_fc, c_proj)
 
                 # 3. RESIDUAL UPDATE & POST-MIX
-                w_res = hyper_w_res[idx]  # (n_lanes, n_lanes + 2)
-                w_post = hyper_w_post[idx]  # (n_lanes, 1)
+                w_res = hyper_w_res[idx]
+                w_post = hyper_w_post[idx]
 
-                # Dynamic lane mixing via einsum
-                lanes_mixed = torch.einsum('bsld,ol->bsod', x_lanes, w_res[:, :self.n_lanes])
-                x0_contrib = x0.unsqueeze(2) * w_res[:, self.n_lanes].view(1, 1, self.n_lanes, 1)
-                xb_contrib = x0_bigram.unsqueeze(2) * w_res[:, self.n_lanes + 1].view(1, 1, self.n_lanes, 1)
-                h_contrib = h.unsqueeze(2) * w_post[:, 0].view(1, 1, self.n_lanes, 1)
-                x_lanes = lanes_mixed + x0_contrib + xb_contrib + h_contrib
+                new_lanes = []
+                for o in range(self.n_lanes):
+                    lane_o = sum(x_lanes[:, :, l] * w_res[o, l] for l in range(self.n_lanes))
+                    lane_o = lane_o + x0 * w_res[o, self.n_lanes] + x0_bigram * w_res[o, self.n_lanes + 1]
+                    lane_o = lane_o + h * w_post[o, 0]
+                    new_lanes.append(lane_o)
+                x_lanes = torch.stack(new_lanes, dim=2)
 
             if i == backout_layer:
                 x_backout = x_lanes[:, :, 0]
 
         # Final output: average all lanes
-        x = x_lanes.mean(dim=2)
+        x = sum(x_lanes[:, :, l] for l in range(self.n_lanes)) * (1.0 / self.n_lanes)
 
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
         x = x - backout_lambda * x_backout
