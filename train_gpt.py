@@ -1180,26 +1180,28 @@ class GPT(nn.Module):
         self.n_lanes = 4
         n_sublayers = 2 * num_layers  # attention + MLP per layer
 
-        # hyper_w_res: (2*layers, n_lanes, n_lanes + 2) - mixes (n_lanes + 2) inputs (lanes + x0 + bigram) -> n_lanes
-        # Init: [Eye(n_lanes) * 1.1, Zeros(n_lanes, 2)] - identity for lanes, zeros for skips
-        hyper_w_res = torch.zeros(n_sublayers, self.n_lanes, self.n_lanes + 2)
-        hyper_w_res[:, :, :self.n_lanes] = 1.1 * torch.eye(self.n_lanes)  # identity for lane mixing
+        # hyper_w_res: (2*layers, n_lanes, n_lanes) - pure lane mixing (no x0/bigram injection in residual)
+        # Init: Eye(n_lanes) * 1.1
+        hyper_w_res = 1.1 * torch.eye(self.n_lanes).unsqueeze(0).expand(n_sublayers, -1, -1).clone()
         self.hyper_w_res = nn.Parameter(hyper_w_res)
         self.hyper_w_res.label = 'hyper_res'
 
         # hyper_w_pre: (2*layers, 1, n_lanes + 2) - aggregates (n_lanes + 2) inputs -> 1 layer input
-        # Init: select lane i%n_lanes, with small peek bias (0.1) for x0 and bigram
+        # Init: mix current lane (0.6) + next lane (0.4) to force state interaction, plus x0/bigram peeks
         hyper_w_pre = torch.zeros(n_sublayers, 1, self.n_lanes + 2)
         for i in range(n_sublayers):
-            hyper_w_pre[i, 0, i % self.n_lanes] = 1.0  # round-robin lane selection
+            current_lane = i % self.n_lanes
+            next_lane = (i + 1) % self.n_lanes
+            hyper_w_pre[i, 0, current_lane] = 0.6  # primary lane
+            hyper_w_pre[i, 0, next_lane] = 0.4  # mixing lane (forces state interaction)
             hyper_w_pre[i, 0, self.n_lanes] = 0.1  # small peek at x0
             hyper_w_pre[i, 0, self.n_lanes + 1] = 0.1  # small peek at bigram
         self.hyper_w_pre = nn.Parameter(hyper_w_pre)
         self.hyper_w_pre.label = 'hyper_pre'
 
         # hyper_w_post: (2*layers, n_lanes, 1) - broadcasts 1 layer output -> n_lanes
-        # Init: 1.0 / sqrt(n_lanes)
-        hyper_w_post = (1.0 / (self.n_lanes ** 0.5)) * torch.ones(n_sublayers, self.n_lanes, 1)
+        # Init: 1.0 (unit scale) so effective residual contribution is 1.0*h (not 0.5*h throttle)
+        hyper_w_post = torch.ones(n_sublayers, self.n_lanes, 1)
         self.hyper_w_post = nn.Parameter(hyper_w_post)
         self.hyper_w_post.label = 'hyper_post'
 
@@ -1319,14 +1321,13 @@ class GPT(nn.Module):
                 # 2. RUN ATTENTION (call attn directly, returns projection only)
                 h = block.attn(norm(x_agg), attn_args, qkvo_w)
 
-                # 3. RESIDUAL UPDATE & POST-MIX
+                # 3. RESIDUAL UPDATE & POST-MIX (pure lane mixing, no x0/bigram injection)
                 w_res = hyper_w_res[idx]
                 w_post = hyper_w_post[idx]
 
                 new_lanes = []
                 for o in range(self.n_lanes):
                     lane_o = sum(x_lanes[:, :, l] * w_res[o, l] for l in range(self.n_lanes))
-                    lane_o = lane_o + x0 * w_res[o, self.n_lanes] + x0_bigram * w_res[o, self.n_lanes + 1]
                     lane_o = lane_o + h * w_post[o, 0]
                     new_lanes.append(lane_o)
                 x_lanes = torch.stack(new_lanes, dim=2)
@@ -1349,14 +1350,13 @@ class GPT(nn.Module):
                 # 2. RUN MLP
                 h = block.mlp(norm(x_agg), c_fc, c_proj)
 
-                # 3. RESIDUAL UPDATE & POST-MIX
+                # 3. RESIDUAL UPDATE & POST-MIX (pure lane mixing, no x0/bigram injection)
                 w_res = hyper_w_res[idx]
                 w_post = hyper_w_post[idx]
 
                 new_lanes = []
                 for o in range(self.n_lanes):
                     lane_o = sum(x_lanes[:, :, l] * w_res[o, l] for l in range(self.n_lanes))
-                    lane_o = lane_o + x0 * w_res[o, self.n_lanes] + x0_bigram * w_res[o, self.n_lanes + 1]
                     lane_o = lane_o + h * w_post[o, 0]
                     new_lanes.append(lane_o)
                 x_lanes = torch.stack(new_lanes, dim=2)
@@ -1862,18 +1862,18 @@ def print0(s, console=False):
             print(s, file=f)
 
 # begin by printing this file (the Python code)
-print0(code)
-print0("="*100)
+print0(code, console=True)
+print0("="*100, console=True)
 # log information about the hardware/software environment this is running on
-print0(f"Running Python {sys.version}")
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
-print0(f"Running Triton version {triton.__version__}")
+print0(f"Running Python {sys.version}", console=True)
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}", console=True)
+print0(f"Running Triton version {triton.__version__}", console=True)
 
 def nvidia_smi():
     import subprocess  # avoid top level import
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
-print0(nvidia_smi())
-print0("="*100)
+print0(nvidia_smi(), console=True)
+print0("="*100, console=True)
 
 model: nn.Module = GPT(
     vocab_size=50257,
@@ -1990,4 +1990,58 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+
+# -----------------------------------------------------------------------------
+# POST-TRAINING ANALYSIS: Hyper-Connection Fingerprints
+# -----------------------------------------------------------------------------
+if master_process:
+    print0("\n" + "="*80, console=True)
+    print0("HYPER-CONNECTION MATRIX ANALYSIS", console=True)
+    print0("="*80, console=True)
+    
+    with torch.no_grad():
+        # Load parameters
+        w_res = model.hyper_w_res.float().cpu()  # (Layers, n, n)
+        w_pre = model.hyper_w_pre.float().cpu()  # (Layers, 1, n+2)
+        w_post = model.hyper_w_post.float().cpu() # (Layers, n, 1)
+        
+        n_layers = w_res.shape[0]
+        n_lanes = model.n_lanes
+        
+        # We will look at Early (Layer 2), Middle (Layer 10), and Late (Layer 20)
+        # Note: Index 2*i is Attn, 2*i+1 is MLP
+        indices_to_check = [2, n_layers // 2, n_layers - 2]
+        labels = ["EARLY (Attn Layer 1)", "MIDDLE (Attn Layer ~6)", "LATE (Attn Layer ~10)"]
+
+        torch.set_printoptions(precision=3, sci_mode=False, linewidth=160)
+
+        for idx, label in zip(indices_to_check, labels):
+            print0(f"\n--- {label} (Sublayer Index {idx}) ---", console=True)
+            
+            # 1. PRE-MIX (Who is the layer reading from?)
+            # Columns 0..n-1 are Lanes. Columns n..n+1 are x0/bigram.
+            pre_weights = w_pre[idx].squeeze()
+            lane_reads = pre_weights[:n_lanes]
+            skip_reads = pre_weights[n_lanes:]
+            print0(f"  [H_pre] Lane Reads: {lane_reads.numpy()}", console=True)
+            print0(f"  [H_pre] Skip Reads: {skip_reads.numpy()} (x0, bigram)", console=True)
+            
+            # 2. POST-BROADCAST (Where is the layer writing to?)
+            # Large values mean this lane gets a strong update from this layer.
+            post_weights = w_post[idx].squeeze()
+            print0(f"  [H_post] Write Strength: {post_weights.numpy()}", console=True)
+
+            # 3. RESIDUAL HIGHWAY (How are lanes mixing?)
+            # Row i is the output for Lane i.
+            # Diagonal dominance = Silos. Off-diagonal = Information Flow.
+            res_matrix = w_res[idx]
+            print0(f"  [H_res] Mixing Matrix (Row=Out, Col=In):\n{res_matrix.numpy()}", console=True)
+
+            # ANALYSIS METRICS
+            # "Identity-ness": How close is it to just copying the state?
+            eye_diff = (res_matrix - torch.eye(n_lanes)).abs().mean()
+            print0(f"  > Matrix Drift from Identity: {eye_diff:.4f}", console=True)
+
+    print0("="*80 + "\n", console=True)
+
 dist.destroy_process_group()
