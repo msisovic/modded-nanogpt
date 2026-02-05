@@ -1176,34 +1176,47 @@ class GPT(nn.Module):
         self.bigram_embed.weight.label = 'bigram_embed'
         nn.init.zeros_(self.bigram_embed.weight)
 
-        # Static Hyper-Connections with Virtual Skip Lanes
+        # ---------------------------------------------------------------------
+        # PAPER-FAITHFUL INIT (Equation 14)
+        # Reader=One-Hot, Writer=Broadcast, Highway=Identity
+        # ---------------------------------------------------------------------
         self.n_lanes = 4
         n_sublayers = 2 * num_layers  # attention + MLP per layer
 
-        # hyper_w_res: (2*layers, n_lanes, n_lanes) - pure lane mixing (no x0/bigram injection in residual)
-        # Init: Eye(n_lanes) * 1.1
-        hyper_w_res = 1.1 * torch.eye(self.n_lanes).unsqueeze(0).expand(n_sublayers, -1, -1).clone()
-        self.hyper_w_res = nn.Parameter(hyper_w_res)
-        self.hyper_w_res.label = 'hyper_res'
-
-        # hyper_w_pre: (2*layers, 1, n_lanes + 2) - aggregates (n_lanes + 2) inputs -> 1 layer input
-        # Init: mix current lane (0.6) + next lane (0.4) to force state interaction, plus x0/bigram peeks
-        hyper_w_pre = torch.zeros(n_sublayers, 1, self.n_lanes + 2)
+        # 1. H_RES: The Highway (A^r_k)
+        # Identity Matrix - lanes act as independent memory streams until mixed.
+        hyper_w_res = torch.zeros(n_sublayers, self.n_lanes, self.n_lanes)
         for i in range(n_sublayers):
-            current_lane = i % self.n_lanes
-            next_lane = (i + 1) % self.n_lanes
-            hyper_w_pre[i, 0, current_lane] = 0.6  # primary lane
-            hyper_w_pre[i, 0, next_lane] = 0.4  # mixing lane (forces state interaction)
-            hyper_w_pre[i, 0, self.n_lanes] = 0.1  # small peek at x0
-            hyper_w_pre[i, 0, self.n_lanes + 1] = 0.1  # small peek at bigram
-        self.hyper_w_pre = nn.Parameter(hyper_w_pre)
-        self.hyper_w_pre.label = 'hyper_pre'
+            hyper_w_res[i] = torch.eye(self.n_lanes)
+        self.hyper_w_res = nn.Parameter(hyper_w_res)
+        self.hyper_w_res.label = 'hyper_res'  # Low LR (1.0x)
 
-        # hyper_w_post: (2*layers, n_lanes, 1) - broadcasts 1 layer output -> n_lanes
-        # Init: 1.0 (unit scale) so effective residual contribution is 1.0*h (not 0.5*h throttle)
-        hyper_w_post = torch.ones(n_sublayers, self.n_lanes, 1)
+        # 2. H_PRE: The Reader (A^m_k)
+        # One-Hot Vector - Layer i reads STRICTLY from Lane i % n_lanes.
+        hyper_w_pre = torch.zeros(n_sublayers, 1, self.n_lanes)
+        for i in range(n_sublayers):
+            target = i % self.n_lanes
+            hyper_w_pre[i, 0, target] = 1.0
+        self.hyper_w_pre = nn.Parameter(hyper_w_pre)
+        self.hyper_w_pre.label = 'hyper_pre'  # High LR (5.0x)
+
+        # 3. H_POST: The Writer (B^k)
+        # CRITICAL: All-Ones Vector - Layer i broadcasts to ALL lanes.
+        # This ensures Layer i+1 can see this output regardless of which lane it reads.
+        # Without this, One-Hot Writer breaks the depth chain (Layer 0 → Lane 0, but Layer 1 reads Lane 1 which is empty).
+        hyper_w_post = torch.zeros(n_sublayers, self.n_lanes, 1)
+        hyper_w_post.fill_(1.0)  # Broadcast to all lanes
         self.hyper_w_post = nn.Parameter(hyper_w_post)
-        self.hyper_w_post.label = 'hyper_post'
+        self.hyper_w_post.label = 'hyper_post'  # High LR (5.0x)
+
+        # 4. Persistent Injection (x0 Bias)
+        # Init to small non-zero (0.01) instead of 0 - gives head start on using context.
+        self.hyper_x0_bias = nn.Parameter(torch.full((n_sublayers, self.n_lanes, 1), 0.01))
+        self.hyper_x0_bias.label = 'hyper_x0_bias'  # High LR (5.0x)
+
+        # 5. Bigram Bias
+        self.hyper_bigram_bias = nn.Parameter(torch.full((n_sublayers, self.n_lanes, 1), 0.01))
+        self.hyper_bigram_bias.label = 'hyper_bigram_bias'  # High LR (5.0x)
 
         pad = (-num_layers * 2 - 3) % dist.get_world_size()  # updated: 2*num_layers (SA lambdas only)
         self.scalars = nn.Parameter(
@@ -1242,6 +1255,8 @@ class GPT(nn.Module):
         hyper_w_pre = self.hyper_w_pre.bfloat16().unbind(0)
         hyper_w_res = self.hyper_w_res.bfloat16().unbind(0)
         hyper_w_post = self.hyper_w_post.bfloat16().unbind(0)
+        hyper_x0_bias = self.hyper_x0_bias.bfloat16().unbind(0)
+        hyper_bigram_bias = self.hyper_bigram_bias.bfloat16().unbind(0)
 
         # set block masks and key shift
         short_bm = ws_short * args.block_size
@@ -1313,22 +1328,27 @@ class GPT(nn.Module):
             if block.attn is not None:
                 idx = 2 * i
 
-                # 1. PRE-MIX (n_lanes + 2 inputs -> 1 agg)
+                # 1. PRE-MIX (Pure History - no x0/bigram, they go in residual)
                 w_pre = hyper_w_pre[idx].squeeze(0)
                 x_agg = sum(x_lanes[:, :, l] * w_pre[l] for l in range(self.n_lanes))
-                x_agg = x_agg + x0 * w_pre[self.n_lanes] + x0_bigram * w_pre[self.n_lanes + 1]
 
                 # 2. RUN ATTENTION (call attn directly, returns projection only)
                 h = block.attn(norm(x_agg), attn_args, qkvo_w)
 
-                # 3. RESIDUAL UPDATE & POST-MIX (pure lane mixing, no x0/bigram injection)
+                # 3. RESIDUAL UPDATE (Persistent Injection - Baseline Parity)
                 w_res = hyper_w_res[idx]
                 w_post = hyper_w_post[idx]
+                x0_b = hyper_x0_bias[idx]      # Fast Learner (lr_mul=5.0)
+                xb_b = hyper_bigram_bias[idx]  # Fast Learner (lr_mul=5.0)
 
                 new_lanes = []
                 for o in range(self.n_lanes):
+                    # A. Mix History (Ring Topology passes info between lanes)
                     lane_o = sum(x_lanes[:, :, l] * w_res[o, l] for l in range(self.n_lanes))
+                    # B. Add New Thoughts (Broadcast layer output)
                     lane_o = lane_o + h * w_post[o, 0]
+                    # C. Add Persistent Context (Baseline Parity - x0 in stream for FUTURE layers)
+                    lane_o = lane_o + (x0 * x0_b[o, 0]) + (x0_bigram * xb_b[o, 0])
                     new_lanes.append(lane_o)
                 x_lanes = torch.stack(new_lanes, dim=2)
 
@@ -1342,22 +1362,27 @@ class GPT(nn.Module):
             if block.mlp is not None:
                 idx = 2 * i + 1
 
-                # 1. PRE-MIX (n_lanes + 2 inputs -> 1 agg)
+                # 1. PRE-MIX (Pure History - no x0/bigram, they go in residual)
                 w_pre = hyper_w_pre[idx].squeeze(0)
                 x_agg = sum(x_lanes[:, :, l] * w_pre[l] for l in range(self.n_lanes))
-                x_agg = x_agg + x0 * w_pre[self.n_lanes] + x0_bigram * w_pre[self.n_lanes + 1]
 
                 # 2. RUN MLP
                 h = block.mlp(norm(x_agg), c_fc, c_proj)
 
-                # 3. RESIDUAL UPDATE & POST-MIX (pure lane mixing, no x0/bigram injection)
+                # 3. RESIDUAL UPDATE (Persistent Injection - Baseline Parity)
                 w_res = hyper_w_res[idx]
                 w_post = hyper_w_post[idx]
+                x0_b = hyper_x0_bias[idx]      # Fast Learner (lr_mul=5.0)
+                xb_b = hyper_bigram_bias[idx]  # Fast Learner (lr_mul=5.0)
 
                 new_lanes = []
                 for o in range(self.n_lanes):
+                    # A. Mix History (Ring Topology passes info between lanes)
                     lane_o = sum(x_lanes[:, :, l] * w_res[o, l] for l in range(self.n_lanes))
+                    # B. Add New Thoughts (Broadcast layer output)
                     lane_o = lane_o + h * w_post[o, 0]
+                    # C. Add Persistent Context (Baseline Parity - x0 in stream for FUTURE layers)
+                    lane_o = lane_o + (x0 * x0_b[o, 0]) + (x0_bigram * xb_b[o, 0])
                     new_lanes.append(lane_o)
                 x_lanes = torch.stack(new_lanes, dim=2)
 
@@ -1666,17 +1691,19 @@ class TrainingManager():
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
-            "hyper_res":      {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "hyper_pre":      {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "hyper_post":     {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "hyper_res":         {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},  # Low LR - stable highway
+            "hyper_pre":         {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},  # High LR - fast adaptation
+            "hyper_post":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "hyper_x0_bias":     {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},  # High LR - fast x0 injection
+            "hyper_bigram_bias": {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},  # High LR - fast bigram injection
+            "lm_head":           {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "hyper_res", "hyper_pre", "hyper_post",  # Small, fast
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "hyper_res", "hyper_pre", "hyper_post", "hyper_x0_bias", "hyper_bigram_bias",  # Small, fast
             "ve0", "ve1", "ve2", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
@@ -2002,8 +2029,10 @@ if master_process:
     with torch.no_grad():
         # Load parameters
         w_res = model.hyper_w_res.float().cpu()  # (Layers, n, n)
-        w_pre = model.hyper_w_pre.float().cpu()  # (Layers, 1, n+2)
+        w_pre = model.hyper_w_pre.float().cpu()  # (Layers, 1, n)
         w_post = model.hyper_w_post.float().cpu() # (Layers, n, 1)
+        x0_bias = model.hyper_x0_bias.float().cpu()  # (Layers, n, 1)
+        bigram_bias = model.hyper_bigram_bias.float().cpu()  # (Layers, n, 1)
         
         n_layers = w_res.shape[0]
         n_lanes = model.n_lanes
@@ -2018,29 +2047,29 @@ if master_process:
         for idx, label in zip(indices_to_check, labels):
             print0(f"\n--- {label} (Sublayer Index {idx}) ---", console=True)
             
-            # 1. PRE-MIX (Who is the layer reading from?)
-            # Columns 0..n-1 are Lanes. Columns n..n+1 are x0/bigram.
+            # 1. PRE-MIX (Who is the layer reading from? - Pure history, no x0/bigram)
             pre_weights = w_pre[idx].squeeze()
-            lane_reads = pre_weights[:n_lanes]
-            skip_reads = pre_weights[n_lanes:]
-            print0(f"  [H_pre] Lane Reads: {lane_reads.numpy()}", console=True)
-            print0(f"  [H_pre] Skip Reads: {skip_reads.numpy()} (x0, bigram)", console=True)
+            print0(f"  [H_pre] Lane Reads: {pre_weights.numpy()}", console=True)
             
             # 2. POST-BROADCAST (Where is the layer writing to?)
-            # Large values mean this lane gets a strong update from this layer.
             post_weights = w_post[idx].squeeze()
             print0(f"  [H_post] Write Strength: {post_weights.numpy()}", console=True)
 
-            # 3. RESIDUAL HIGHWAY (How are lanes mixing?)
-            # Row i is the output for Lane i.
-            # Diagonal dominance = Silos. Off-diagonal = Information Flow.
+            # 3. PERSISTENT INJECTION (x0 and bigram bias - Baseline Parity)
+            x0_b = x0_bias[idx].squeeze()
+            xb_b = bigram_bias[idx].squeeze()
+            print0(f"  [x0_bias] Injection per Lane: {x0_b.numpy()}", console=True)
+            print0(f"  [bigram_bias] Injection per Lane: {xb_b.numpy()}", console=True)
+
+            # 4. RESIDUAL HIGHWAY (How are lanes mixing?)
             res_matrix = w_res[idx]
             print0(f"  [H_res] Mixing Matrix (Row=Out, Col=In):\n{res_matrix.numpy()}", console=True)
 
             # ANALYSIS METRICS
-            # "Identity-ness": How close is it to just copying the state?
-            eye_diff = (res_matrix - torch.eye(n_lanes)).abs().mean()
-            print0(f"  > Matrix Drift from Identity: {eye_diff:.4f}", console=True)
+            # Drift from Identity: How much has the model learned to mix lanes?
+            identity_init = torch.eye(n_lanes)
+            drift = (res_matrix - identity_init).abs().mean()
+            print0(f"  > Matrix Drift from Identity: {drift:.4f}", console=True)
 
     print0("="*80 + "\n", console=True)
 
