@@ -1177,46 +1177,49 @@ class GPT(nn.Module):
         nn.init.zeros_(self.bigram_embed.weight)
 
         # ---------------------------------------------------------------------
-        # PAPER-FAITHFUL INIT (Equation 14)
-        # Reader=One-Hot, Writer=Broadcast, Highway=Identity
+        # HYPER-CONNECTIONS INIT (Gentle Depth Bias)
+        # 1.02 provides signal growth without instability that 1.05 caused
         # ---------------------------------------------------------------------
         self.n_lanes = 4
         n_sublayers = 2 * num_layers  # attention + MLP per layer
 
-        # 1. H_RES: The Highway (A^r_k)
-        # Identity Matrix - lanes act as independent memory streams until mixed.
+        # 1. H_RES: The Highway (1.02 Compromise)
+        # 1.0 was stable but flat. 1.05 was unstable.
+        # 1.02 provides gentle "Depth Bias" without shock.
+        # Per block: 1.02² ≈ 1.04, Total network: 1.02^22 ≈ 1.55
         hyper_w_res = torch.zeros(n_sublayers, self.n_lanes, self.n_lanes)
         for i in range(n_sublayers):
-            hyper_w_res[i] = torch.eye(self.n_lanes)
+            hyper_w_res[i] = 1.02 * torch.eye(self.n_lanes)
         self.hyper_w_res = nn.Parameter(hyper_w_res)
-        self.hyper_w_res.label = 'hyper_res'  # Low LR (1.0x)
+        self.hyper_w_res.label = 'hyper_res'
 
-        # 2. H_PRE: The Reader (A^m_k)
-        # One-Hot Vector - Layer i reads STRICTLY from Lane i % n_lanes.
+        # 2. H_PRE: The Reader (One-Hot)
         hyper_w_pre = torch.zeros(n_sublayers, 1, self.n_lanes)
         for i in range(n_sublayers):
             target = i % self.n_lanes
             hyper_w_pre[i, 0, target] = 1.0
         self.hyper_w_pre = nn.Parameter(hyper_w_pre)
-        self.hyper_w_pre.label = 'hyper_pre'  # High LR (5.0x)
+        self.hyper_w_pre.label = 'hyper_pre'
 
-        # 3. H_POST: The Writer (B^k)
-        # CRITICAL: All-Ones Vector - Layer i broadcasts to ALL lanes.
-        # This ensures Layer i+1 can see this output regardless of which lane it reads.
-        # Without this, One-Hot Writer breaks the depth chain (Layer 0 → Lane 0, but Layer 1 reads Lane 1 which is empty).
+        # 3. H_POST: The Writer (Broadcast)
         hyper_w_post = torch.zeros(n_sublayers, self.n_lanes, 1)
-        hyper_w_post.fill_(1.0)  # Broadcast to all lanes
+        hyper_w_post.fill_(1.0)
         self.hyper_w_post = nn.Parameter(hyper_w_post)
-        self.hyper_w_post.label = 'hyper_post'  # High LR (5.0x)
+        self.hyper_w_post.label = 'hyper_post'
 
-        # 4. Persistent Injection (x0 Bias)
-        # Init to small non-zero (0.01) instead of 0 - gives head start on using context.
-        self.hyper_x0_bias = nn.Parameter(torch.full((n_sublayers, self.n_lanes, 1), 0.01))
-        self.hyper_x0_bias.label = 'hyper_x0_bias'  # High LR (5.0x)
+        # 4. x0 Bias - Baseline is 0.0, keep it 0.0
+        self.hyper_x0_bias = nn.Parameter(torch.zeros(n_sublayers, self.n_lanes, 1))
+        self.hyper_x0_bias.label = 'hyper_x0_bias'
 
-        # 5. Bigram Bias
-        self.hyper_bigram_bias = nn.Parameter(torch.full((n_sublayers, self.n_lanes, 1), 0.01))
-        self.hyper_bigram_bias.label = 'hyper_bigram_bias'  # High LR (5.0x)
+        # 5. Bigram Bias - Baseline is 0.1 per Block, distributed as 0.05 per Sublayer
+        # Even sublayers (Attn) get 0.05, odd sublayers (MLP) get 0.0
+        # Sublayer 0 is used for pre-injection, skipped in loop to avoid double-add
+        hyper_bigram_bias = torch.zeros(n_sublayers, self.n_lanes, 1)
+        for i in range(n_sublayers):
+            if i % 2 == 0:
+                hyper_bigram_bias[i].fill_(0.05)  # Learnable 0.05
+        self.hyper_bigram_bias = nn.Parameter(hyper_bigram_bias)
+        self.hyper_bigram_bias.label = 'hyper_bigram_bias'
 
         pad = (-num_layers * 2 - 3) % dist.get_world_size()  # updated: 2*num_layers (SA lambdas only)
         self.scalars = nn.Parameter(
@@ -1281,8 +1284,14 @@ class GPT(nn.Module):
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
-        # Initialize x_lanes: (B, S, n_lanes, D) - both lanes start with x0
+        # Initialize x_lanes: (B, S, n_lanes, D) - all lanes start with x0
         x_lanes = x0.unsqueeze(2).expand(-1, -1, self.n_lanes, -1).clone()
+
+        # --- Layer 0 Pre-Injection ---
+        # Baseline adds bigram BEFORE block 0 runs. We must do the same.
+        # Use the LEARNABLE parameter for sublayer 0 (skipped in loop to avoid double-add)
+        # hyper_bigram_bias[0]: [n_lanes, 1] -> broadcast to [B, T, n_lanes, D]
+        x_lanes = x_lanes + (x0_bigram.unsqueeze(2) * hyper_bigram_bias[0].view(1, 1, self.n_lanes, 1))
 
         # unbind gate banks to avoid select_backwards kernel
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)] 
@@ -1348,7 +1357,10 @@ class GPT(nn.Module):
                     # B. Add New Thoughts (Broadcast layer output)
                     lane_o = lane_o + h * w_post[o, 0]
                     # C. Add Persistent Context (Baseline Parity - x0 in stream for FUTURE layers)
-                    lane_o = lane_o + (x0 * x0_b[o, 0]) + (x0_bigram * xb_b[o, 0])
+                    # Skip bigram for idx=0 (sublayer 0) - already pre-injected before loop
+                    lane_o = lane_o + (x0 * x0_b[o, 0])
+                    if idx > 0:
+                        lane_o = lane_o + (x0_bigram * xb_b[o, 0])
                     new_lanes.append(lane_o)
                 x_lanes = torch.stack(new_lanes, dim=2)
 
@@ -1691,11 +1703,11 @@ class TrainingManager():
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
-            "hyper_res":         {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},  # Low LR - stable highway
-            "hyper_pre":         {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},  # High LR - fast adaptation
-            "hyper_post":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "hyper_x0_bias":     {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},  # High LR - fast x0 injection
-            "hyper_bigram_bias": {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},  # High LR - fast bigram injection
+            "hyper_res":         {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "hyper_pre":         {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "hyper_post":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "hyper_x0_bias":     {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "hyper_bigram_bias": {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
             "lm_head":           {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
