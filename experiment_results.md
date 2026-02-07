@@ -345,12 +345,53 @@ Breakdown of HC overhead at Stage 2:
 - HC actual: ~470ms step_avg @ 1555 steps
 - Real overhead: ~26ms or ~6%
 
+## Exp 31: HC at 1545 steps + full master baseline wall time comparison
+**HC Config:** Clean refactored code, num_scheduled_iterations=1505 (1545 total).
+**Master:** Standard master branch, num_scheduled_iterations=1515 (1555 total).
+Both runs on same hardware (single H200), back-to-back.
+
+| | HC | Master | Delta |
+|---|---|---|---|
+| **val_loss** | **3.2759** | 3.2820 | **-0.0061** |
+| **steps** | 1545 | 1555 | -10 |
+| **train_time** | 713.9s | 678.4s | +35.5s (+5.2%) |
+| **step_avg** | 462ms | 436ms | +26ms (+6.0%) |
+
+HC trajectories:
+```
+step:0/1545    val_loss:10.8311
+step:250/1545  val_loss:4.5661  step_avg:254ms
+step:500/1545  val_loss:4.2236  step_avg:253ms
+step:750/1545  val_loss:3.8570  step_avg:319ms
+step:1000/1545 val_loss:3.5622  step_avg:352ms
+step:1250/1545 val_loss:3.3908  step_avg:414ms
+step:1500/1545 val_loss:3.2896  step_avg:456ms
+step:1545/1545 val_loss:3.2759  step_avg:462ms
+```
+Master trajectories:
+```
+step:0/1555    val_loss:10.8305
+step:250/1555  val_loss:4.5364  step_avg:230ms
+step:500/1555  val_loss:4.2263  step_avg:229ms
+step:750/1555  val_loss:3.8806  step_avg:294ms
+step:1000/1555 val_loss:3.5755  step_avg:327ms
+step:1250/1555 val_loss:3.4016  step_avg:388ms
+step:1500/1555 val_loss:3.2982  step_avg:429ms
+step:1555/1555 val_loss:3.2820  step_avg:436ms
+```
+**Note:** Both runs show higher val_loss than historical best (HC 3.2741, master 3.2769).
+Run-to-run variance is ~0.003-0.005. HC beats master in this head-to-head by 0.0061.
+Wall time cost: +35.5s (+5.2%) for 10 fewer steps and better loss.
+
 ---
 ### Summary of Post-Merge Experiments
-**Baseline:** 3.2769 @ 1555 steps, step_avg ~444ms
-**Best HC (val_loss):** Exp 20 = 3.2745 @ 1555 steps (**-0.0024**)
-**Best HC (cleaned up):** Exp 28 = 3.2741 @ 1555 steps (**-0.0028**, step_avg=470ms, ~6% overhead)
-**HC at 1540 steps:** Exp 29 = 3.2766 @ 1540 (**-0.0003**, reaches baseline ~step 1536)
+**Baseline (historical):** 3.2769 @ 1555 steps, step_avg ~436ms
+**Best HC (val_loss):** Exp 28 = 3.2741 @ 1555 steps (**-0.0028**, step_avg=470ms, ~6% overhead)
+**HC at 1545 steps:** Exp 31 = 3.2759 @ 1545 (**-0.0010**, +35.5s wall time vs master)
+**HC at 1540 steps:** Exp 30 = 3.2776 @ 1540 (borderline, run-to-run variance ~0.003)
+
+Wall time: HC costs ~5% more wall time than master for the same val_loss or better.
+On 8xH100 cluster, overhead should be smaller (2-3%) due to compute-bound per-GPU workload.
 
 All modifications to Exp 20 val_loss config have been worse. The config is at a local optimum:
 - Frozen w_res (identity), frozen w_pre (round-robin one-hot)
