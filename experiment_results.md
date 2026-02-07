@@ -255,3 +255,18 @@ instead of per-sublayer per-lane hyper_x0_bias.
 Reduces HC params from 44+44 to 22+22. Same optimizer settings.
 **Result:** val_loss=**3.2811** @ 1555. Worse than Exp 20 (3.2745). Per-lane specialization
 of x0_bias/bigram_bias is valuable. Reverted.
+
+## Exp 25b: Combine HC + baseline x0_lambdas
+**Config:** Exp 20 + baseline x0_lambdas (per-layer, adam_betas=[0.65,0.95], lr_mul=5.0).
+x0 contribution = (x0_lambdas[i] + x0_bias[o]) * x0. Two signals: per-layer coarse + per-sublayer per-lane fine.
+**Result:** val_loss=**3.2796** @ 1555. Worse than Exp 20. Redundant x0 signals interfere. Reverted.
+
+---
+### Summary of Post-Merge Experiments
+**Baseline:** 3.2768 @ 1555 steps (measured)
+**Best HC:** Exp 20 = 3.2745 @ 1555 steps (**-0.0023**)
+All modifications to Exp 20 config have been worse. The config is at a local optimum:
+- Frozen w_res (identity), frozen w_pre (round-robin one-hot)
+- Learned w_post, x0_bias, bigram_bias (per-sublayer per-lane)
+- Learned resid_lambda (per-sublayer, init sqrt(1.1))
+- All HC params: adam_betas=[0.9, 0.99], lr_mul=1.0 (except resid_lambda lr_mul=5.0)
