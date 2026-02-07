@@ -204,3 +204,28 @@ Fewer HC params = more optimizer capacity for the params that matter.
 **Config:** Exp 17 + learned `hyper_output_w` per-lane scalar for final output (init 0.5 each)
 **Hypothesis:** Equal lane averaging may not be optimal. Let model learn output weighting.
 **Result:** val_loss=**3.2750** @ 1600. Worse than Exp 17. Equal averaging is fine. Reverted.
+
+---
+
+## === NEW BASELINE (post-merge) ===
+## Baseline: val_loss=3.2769 @ 1555 steps (1515 scheduled + 40 extension)
+## Master changes: single value_embed, mimetic init, x0_lambdas separation, Yarn refactor
+
+---
+
+## Exp 20: Verify Exp 17 config on new baseline
+**Config:** Exact Exp 17 config (frozen w_res, frozen w_pre, learned w_post, 2 lanes, resid_lambda sqrt(1.1))
+merged onto new master (single value_embed, mimetic init, 1555 steps).
+**Result:** val_loss=**3.2745** @ 1555. **BEATS NEW BASELINE** by 0.0024.
+```
+step:0/1555    val_loss:10.8294
+step:250/1555  val_loss:4.5614  step_avg:308ms
+step:500/1555  val_loss:4.2414  step_avg:308ms
+step:750/1555  val_loss:3.8653  step_avg:365ms
+step:1000/1555 val_loss:3.5690  step_avg:394ms
+step:1250/1555 val_loss:3.3934  step_avg:458ms
+step:1500/1555 val_loss:3.2908  step_avg:501ms
+step:1555/1555 val_loss:3.2745  step_avg:509ms
+```
+HC still works on new baseline. Margin reduced from -0.0049 (old) to -0.0024 (new),
+partly because we have 45 fewer steps (1555 vs 1600).
