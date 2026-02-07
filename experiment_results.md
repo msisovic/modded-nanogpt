@@ -311,6 +311,8 @@ step:1250/1540 val_loss:3.3922  step_avg:417ms
 step:1500/1540 val_loss:3.2890  step_avg:459ms
 step:1540/1540 val_loss:3.2776  step_avg:465ms
 ```
+**Verification run (pre-refactor code at 72178d5, same 1540 steps):** val_loss=**3.2795**.
+Pre-refactor is WORSE — confirms refactor is clean; 1540 steps is borderline (run-to-run variance ~0.003).
 
 ---
 
