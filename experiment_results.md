@@ -166,3 +166,29 @@ step:1500/1600 val_loss:3.3019
 step:1600/1600 val_loss:3.2727
 ```
 Cumulative resid_lambda gain: 0.1236 (heavy decay). Fewer params = better convergence.
+
+## Exp 14: Depth-ramped w_post init (0.8→1.8)
+**Result:** val_loss=**3.2788** @ 1600. Worse. Flat 1.0 init is better. Reverted.
+
+## Exp 15: Per-lane resid_lambda
+**Result:** val_loss=**3.2748** @ 1600. Slightly worse than Exp 13. Extra params hurt. Reverted.
+
+## Exp 16: Frozen w_res + frozen w_post
+**Result:** val_loss=**3.2769** @ 1600. Exactly baseline. w_post IS important — freezing it
+removes our advantage completely. Learned w_post is critical for depth-dependent weighting.
+
+## Exp 17: Frozen w_res + frozen w_pre (keep w_post learned)
+**Config:** Exp 13 base + also freeze w_pre at round-robin one-hot
+**Learned params:** w_post, resid_lambda, x0_bias, bigram_bias only
+**Result:** val_loss=**3.2720** @ 1600. **NEW BEST!** Beats baseline by 0.0049.
+```
+step:250/1600  val_loss:4.5879
+step:500/1600  val_loss:4.2436
+step:750/1600  val_loss:3.8823
+step:1000/1600 val_loss:3.5880
+step:1250/1600 val_loss:3.4097
+step:1500/1600 val_loss:3.3013
+step:1600/1600 val_loss:3.2720
+```
+Pattern: frozen w_res + frozen w_pre + learned w_post = sweet spot.
+Fewer HC params = more optimizer capacity for the params that matter.

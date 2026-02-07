@@ -1190,15 +1190,14 @@ class GPT(nn.Module):
             hyper_w_res[i] = torch.eye(self.n_lanes)
         self.register_buffer('hyper_w_res', hyper_w_res)  # frozen, not learned
 
-        # 2. H_PRE: Round-robin one-hot (attn→lane0, MLP→lane1)
+        # 2. H_PRE: Fixed round-robin one-hot (attn→lane0, MLP→lane1)
         hyper_w_pre = torch.zeros(n_sublayers, 1, self.n_lanes)
         for i in range(n_sublayers):
             target = i % self.n_lanes
             hyper_w_pre[i, 0, target] = 1.0
-        self.hyper_w_pre = nn.Parameter(hyper_w_pre)
-        self.hyper_w_pre.label = 'hyper_pre'
+        self.register_buffer('hyper_w_pre', hyper_w_pre)  # frozen one-hot
 
-        # 3. H_POST: Broadcast to all lanes
+        # 3. H_POST: Broadcast to all lanes (learned — critical for depth-dependent weighting)
         hyper_w_post = torch.zeros(n_sublayers, self.n_lanes, 1)
         hyper_w_post.fill_(1.0)
         self.hyper_w_post = nn.Parameter(hyper_w_post)
@@ -1698,7 +1697,6 @@ class TrainingManager():
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
-            "hyper_pre":           {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
             "hyper_post":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
             "hyper_x0_bias":       {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
             "hyper_bigram_bias":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
@@ -1710,7 +1708,7 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "hyper_pre", "hyper_post", "hyper_x0_bias", "hyper_bigram_bias", "hyper_resid_lambda",  # Small, fast
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "hyper_post", "hyper_x0_bias", "hyper_bigram_bias", "hyper_resid_lambda",  # Small, fast
             "ve0", "ve1", "ve2", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
