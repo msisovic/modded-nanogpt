@@ -282,17 +282,60 @@ step:1250/1555 val_loss:3.3933  step_avg:419ms
 step:1500/1555 val_loss:3.2908  step_avg:460ms
 step:1555/1555 val_loss:3.2746  step_avg:468ms
 ```
-HC crosses baseline loss (3.2768) around step ~1548. Still 2.13x overhead vs baseline (220ms).
+HC crosses baseline loss (3.2769) around step ~1548. ~6% overhead vs baseline (see AB test below).
+
+## Exp 28: Remove frozen buffers + fold bigram into main expression
+**Config:** Exp 27 + removed hyper_w_res/hyper_w_pre registered buffers (hardcoded identity/one-hot),
+folded bigram addition into main residual update (no separate `if idx > 0:` branch).
+**Result:** val_loss=**3.2741** @ 1555, step_avg=**470ms**. No speed improvement from removing frozen buffers.
+
+## Exp 29: Block-based forward_hc method
+**Config:** Exp 28 + moved HC forward logic into Block.forward_hc() method. Hypothesis: kernel fusion
+would improve if attention+residual are in the same function scope.
+**Result:** val_loss=**3.2766** @ 1540 steps (num_scheduled_iterations=1500), step_avg=**487ms**.
+SLOWER than inline approach (470ms). Function boundaries don't help torch.compile. Reverted to inline.
+
+---
+
+## Performance Analysis: AB Test (HC Overhead Isolation)
+
+Ran 4 variants for 100 steps each (num_scheduled_iterations=60, 3 stages of 20 steps + 40 extension)
+to isolate HC overhead. Per-stage incremental step times (excluding outliers >800ms):
+
+| Variant | Stage 0 (batch=8) | Stage 1 (batch=16) | Stage 2 (batch=24) |
+|---------|------------------|-------------------|-------------------|
+| **Master baseline** | 232ms | 432ms | 652ms |
+| **A** (1 lane, no HC) | 234ms | 416ms | 663ms |
+| **B** (2 lanes, no scalars) | 259ms | 428ms | 631ms |
+| **C** (2 lanes, full HC) | 279ms | 457ms | 665ms |
+
+**Key Finding: HC overhead is ~6%, not ~2x as previously estimated.**
+
+The "2x overhead" claim was based on comparing step_avg across different run lengths with different
+stage distributions. The actual master baseline step_avg at 1555 steps is ~444ms (not ~220ms).
+HC full configuration predicts ~472ms at 1555 steps, matching the measured 470ms.
+
+Breakdown of HC overhead at Stage 2:
+- 2-lane tensors: +0ms (within noise of master baseline)
+- HC scalar multiplications: +13ms (~2%)
+- Total HC overhead: +13ms per step at stage 2
+
+**Corrected summary:**
+- Previous "step_avg=220ms baseline" was incorrect (may have been from an earlier codebase/hardware)
+- Master actual: ~444ms step_avg @ 1555 steps
+- HC actual: ~470ms step_avg @ 1555 steps
+- Real overhead: ~26ms or ~6%
 
 ---
 ### Summary of Post-Merge Experiments
-**Baseline:** 3.2768 @ 1555 steps, step_avg=220ms
-**Best HC:** Exp 20 = 3.2745 @ 1555 steps (**-0.0023**, step_avg=509ms)
-**Fastest HC:** Exp 27 = 3.2746 @ 1555 steps (**-0.0022**, step_avg=468ms, 2.13x overhead)
+**Baseline:** 3.2769 @ 1555 steps, step_avg ~444ms
+**Best HC (val_loss):** Exp 20 = 3.2745 @ 1555 steps (**-0.0024**)
+**Best HC (cleaned up):** Exp 28 = 3.2741 @ 1555 steps (**-0.0028**, step_avg=470ms, ~6% overhead)
+**HC at 1540 steps:** Exp 29 = 3.2766 @ 1540 (**-0.0003**, reaches baseline ~step 1536)
 
 All modifications to Exp 20 val_loss config have been worse. The config is at a local optimum:
 - Frozen w_res (identity), frozen w_pre (round-robin one-hot)
 - Learned w_post, x0_bias, bigram_bias (per-sublayer per-lane)
 - Learned resid_lambda (per-sublayer, init sqrt(1.1))
 - All HC params: adam_betas=[0.9, 0.99], lr_mul=1.0 (except resid_lambda lr_mul=5.0)
-- Forward pass: separate lane0/lane1 tensors with explicit scalar mults (Exp 27)
+- Forward pass: separate lane0/lane1 tensors with explicit scalar mults (Exp 27/28)

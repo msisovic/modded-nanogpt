@@ -1005,6 +1005,22 @@ class Block(nn.Module):
             x = x + self.mlp(norm(x), c_fc, c_proj)
         return x
 
+    def forward_hc(self, lane0, lane1, attn_args, qkvo_w, c_fc, c_proj,
+                   rl_a, wp0_a, wp1_a, xb0_a, xb1_a, bb0_a, bb1_a,
+                   rl_m, wp0_m, wp1_m, xb0_m, xb1_m, bb0_m, bb1_m,
+                   x0, x0_bigram):
+        skip_val = None
+        if self.attn is not None:
+            h = self.attn(norm(lane0), attn_args, qkvo_w)
+            lane0 = rl_a * lane0 + h * wp0_a + x0 * xb0_a + x0_bigram * bb0_a
+            lane1 = rl_a * lane1 + h * wp1_a + x0 * xb1_a + x0_bigram * bb1_a
+            skip_val = lane0
+        if self.mlp is not None:
+            h = self.mlp(norm(lane1), c_fc, c_proj)
+            lane0 = rl_m * lane0 + h * wp0_m + x0 * xb0_m + x0_bigram * bb0_m
+            lane1 = rl_m * lane1 + h * wp1_m + x0 * xb1_m + x0_bigram * bb1_m
+        return lane0, lane1, skip_val
+
 # -----------------------------------------------------------------------------
 # The main model
 
@@ -1114,46 +1130,21 @@ class GPT(nn.Module):
         self.bigram_embed.weight.label = 'bigram_embed'
         nn.init.zeros_(self.bigram_embed.weight)
 
-        # ---------------------------------------------------------------------
-        # HYPER-CONNECTIONS INIT (2-lane with resid_lambda)
-        # 2 lanes: even sublayers (attn) read lane 0, odd (MLP) read lane 1
-        # resid_lambda provides gain (like baseline's resid_lambdas)
-        # ---------------------------------------------------------------------
+        # Hyper-connections: 2-lane residual stream (attn reads lane0, MLP reads lane1)
         self.n_lanes = 2
-        n_sublayers = 2 * num_layers  # attention + MLP per layer
+        n_sublayers = 2 * num_layers
 
-        # 1. H_RES: Fixed identity (gain handled by resid_lambda, mixing too slow to learn)
-        hyper_w_res = torch.zeros(n_sublayers, self.n_lanes, self.n_lanes)
-        for i in range(n_sublayers):
-            hyper_w_res[i] = torch.eye(self.n_lanes)
-        self.register_buffer('hyper_w_res', hyper_w_res)  # frozen, not learned
-
-        # 2. H_PRE: Fixed round-robin one-hot (attn→lane0, MLP→lane1)
-        hyper_w_pre = torch.zeros(n_sublayers, 1, self.n_lanes)
-        for i in range(n_sublayers):
-            target = i % self.n_lanes
-            hyper_w_pre[i, 0, target] = 1.0
-        self.register_buffer('hyper_w_pre', hyper_w_pre)  # frozen one-hot
-
-        # 3. H_POST: Broadcast to all lanes (learned — critical for depth-dependent weighting)
-        hyper_w_post = torch.zeros(n_sublayers, self.n_lanes, 1)
-        hyper_w_post.fill_(1.0)
-        self.hyper_w_post = nn.Parameter(hyper_w_post)
+        self.hyper_w_post = nn.Parameter(torch.ones(n_sublayers, self.n_lanes, 1))
         self.hyper_w_post.label = 'hyper_post'
 
-        # 4. x0 Bias - init 0.0 (baseline's x0_lambdas init 0.0)
         self.hyper_x0_bias = nn.Parameter(torch.zeros(n_sublayers, self.n_lanes, 1))
         self.hyper_x0_bias.label = 'hyper_x0_bias'
 
-        # 5. Bigram Bias - 0.05 for even sublayers (attn), 0.0 for odd (MLP)
         hyper_bigram_bias = torch.zeros(n_sublayers, self.n_lanes, 1)
-        for i in range(n_sublayers):
-            if i % 2 == 0:
-                hyper_bigram_bias[i].fill_(0.05)
+        hyper_bigram_bias[0::2] = 0.05  # attn sublayers only
         self.hyper_bigram_bias = nn.Parameter(hyper_bigram_bias)
         self.hyper_bigram_bias.label = 'hyper_bigram_bias'
 
-        # 6. Resid Lambda - per-sublayer gain (sqrt(1.1) matches baseline's 1.1/block)
         self.hyper_resid_lambda = nn.Parameter(math.sqrt(1.1) * torch.ones(n_sublayers))
         self.hyper_resid_lambda.label = 'hyper_resid_lambda'
 
@@ -1190,16 +1181,14 @@ class GPT(nn.Module):
         backout_lambda = self.scalars[2 * self.num_layers + 1]
         skip_lambda = self.scalars[2 * self.num_layers + 2]
 
-        # unbind learned hyper weights to avoid select_backwards kernel (cast to bfloat16)
-        # w_pre (frozen one-hot) and w_res (frozen identity) replaced with explicit scalar ops below
-        # Split per-lane scalars for explicit scalar multiplication (no 4D broadcasting)
-        hyper_w_post_0 = self.hyper_w_post[:, 0, 0].bfloat16().unbind(0)
-        hyper_w_post_1 = self.hyper_w_post[:, 1, 0].bfloat16().unbind(0)
-        hyper_x0_bias_0 = self.hyper_x0_bias[:, 0, 0].bfloat16().unbind(0)
-        hyper_x0_bias_1 = self.hyper_x0_bias[:, 1, 0].bfloat16().unbind(0)
-        hyper_bigram_bias_0 = self.hyper_bigram_bias[:, 0, 0].bfloat16().unbind(0)
-        hyper_bigram_bias_1 = self.hyper_bigram_bias[:, 1, 0].bfloat16().unbind(0)
-        hyper_resid_lambda = self.hyper_resid_lambda.bfloat16().unbind(0)
+        # Unbind HC scalars per-sublayer per-lane (avoids select_backwards kernel)
+        wp0 = self.hyper_w_post[:, 0, 0].bfloat16().unbind(0)
+        wp1 = self.hyper_w_post[:, 1, 0].bfloat16().unbind(0)
+        xb0 = self.hyper_x0_bias[:, 0, 0].bfloat16().unbind(0)
+        xb1 = self.hyper_x0_bias[:, 1, 0].bfloat16().unbind(0)
+        bb0 = self.hyper_bigram_bias[:, 0, 0].bfloat16().unbind(0)
+        bb1 = self.hyper_bigram_bias[:, 1, 0].bfloat16().unbind(0)
+        rl = self.hyper_resid_lambda.bfloat16().unbind(0)
 
         # set block masks and key shift
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
@@ -1221,16 +1210,10 @@ class GPT(nn.Module):
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
-        # Initialize two separate (B, S, D) lane tensors — no 4D overhead
-        lane0 = x0.clone()
-        lane1 = x0.clone()
+        # Initialize 2-lane residual stream with pre-layer-0 bigram injection
+        lane0 = x0 + x0_bigram * bb0[0]
+        lane1 = x0 + x0_bigram * bb1[0]
 
-        # --- Layer 0 Pre-Injection ---
-        # Baseline adds bigram BEFORE block 0 runs. We must do the same.
-        lane0 = lane0 + x0_bigram * hyper_bigram_bias_0[0]
-        lane1 = lane1 + x0_bigram * hyper_bigram_bias_1[0]
-
-        # unbind gate banks to avoid select_backwards kernel
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
@@ -1246,69 +1229,35 @@ class GPT(nn.Module):
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
             attn_args = AttnArgs(
-                ve=ve[i],
-                sa_lambdas=sa_lambdas[i],
-                seqlens=seqlens,
-                bm_size=bm_sizes[i],
-                yarn=yarn,
-                key_offset=key_offset[i],
-                attn_gate_w=attn_gates[i],
-                ve_gate_w=ve_gates[i]
+                ve=ve[i], sa_lambdas=sa_lambdas[i], seqlens=seqlens,
+                bm_size=bm_sizes[i], yarn=yarn, key_offset=key_offset[i],
+                attn_gate_w=attn_gates[i], ve_gate_w=ve_gates[i]
             )
-
-            # Get weights for this layer from banks
             qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
             c_fc = mlp_fcs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
             c_proj = mlp_projs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
 
-            block = self.blocks[i]
-
-            # Skip-out connection (layer 6 has no attention, so handle before sublayers)
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
                 skip_val = skip_connections.pop()
                 lane0 = lane0 + skip_gate_out * skip_val
                 lane1 = lane1 + skip_gate_out * skip_val
 
-            # ==========================================
-            # STEP 1: ATTENTION SUBLAYER (Index 2*i)
-            # ==========================================
+            block = self.blocks[i]
+            si = 2 * i  # sublayer index for attn
             if block.attn is not None:
-                idx = 2 * i
-
-                # 1. PRE-MIX: even sublayers read lane 0
                 h = block.attn(norm(lane0), attn_args, qkvo_w)
-
-                # 2. RESIDUAL UPDATE: w_res=identity, explicit scalar mults per lane
-                rl = hyper_resid_lambda[idx]
-                lane0 = rl * lane0 + h * hyper_w_post_0[idx] + x0 * hyper_x0_bias_0[idx]
-                lane1 = rl * lane1 + h * hyper_w_post_1[idx] + x0 * hyper_x0_bias_1[idx]
-                if idx > 0:
-                    lane0 = lane0 + x0_bigram * hyper_bigram_bias_0[idx]
-                    lane1 = lane1 + x0_bigram * hyper_bigram_bias_1[idx]
-
-            # Skip-in connection (after attention sublayer)
+                lane0 = rl[si] * lane0 + h * wp0[si] + x0 * xb0[si] + x0_bigram * bb0[si]
+                lane1 = rl[si] * lane1 + h * wp1[si] + x0 * xb1[si] + x0_bigram * bb1[si]
             if i in skip_in:
                 skip_connections.append(lane0)
-
-            # ==========================================
-            # STEP 2: MLP SUBLAYER (Index 2*i + 1)
-            # ==========================================
             if block.mlp is not None:
-                idx = 2 * i + 1
-
-                # 1. PRE-MIX: odd sublayers read lane 1
                 h = block.mlp(norm(lane1), c_fc, c_proj)
-
-                # 2. RESIDUAL UPDATE: w_res=identity, explicit scalar mults per lane
-                rl = hyper_resid_lambda[idx]
-                lane0 = rl * lane0 + h * hyper_w_post_0[idx] + x0 * hyper_x0_bias_0[idx] + x0_bigram * hyper_bigram_bias_0[idx]
-                lane1 = rl * lane1 + h * hyper_w_post_1[idx] + x0 * hyper_x0_bias_1[idx] + x0_bigram * hyper_bigram_bias_1[idx]
-
+                lane0 = rl[si+1] * lane0 + h * wp0[si+1] + x0 * xb0[si+1] + x0_bigram * bb0[si+1]
+                lane1 = rl[si+1] * lane1 + h * wp1[si+1] + x0 * xb1[si+1] + x0_bigram * bb1[si+1]
             if i == backout_layer:
                 x_backout = lane0
 
-        # Final output: average both lanes
         x = (lane0 + lane1) * 0.5
 
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
@@ -1518,7 +1467,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1515  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1500  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1916,15 +1865,13 @@ if master_process:
     print0("="*80, console=True)
     
     with torch.no_grad():
-        # Load parameters
-        w_res = model.hyper_w_res.float().cpu()  # (Layers, n, n)
-        w_pre = model.hyper_w_pre.float().cpu()  # (Layers, 1, n)
+        # Load learned parameters (w_res=identity and w_pre=round-robin are hardcoded, not stored)
         w_post = model.hyper_w_post.float().cpu() # (Layers, n, 1)
         x0_bias = model.hyper_x0_bias.float().cpu()  # (Layers, n, 1)
         bigram_bias = model.hyper_bigram_bias.float().cpu()  # (Layers, n, 1)
         resid_lambda = model.hyper_resid_lambda.float().cpu()  # (Layers,)
 
-        n_layers = w_res.shape[0]
+        n_sublayers = w_post.shape[0]
         n_lanes = model.n_lanes
 
         # Report resid_lambda
@@ -1933,7 +1880,7 @@ if master_process:
         print0(f"[resid_lambda] Cumulative gain: {cumulative_gain:.4f}", console=True)
 
         # We will look at Early, Middle, and Late sublayers
-        indices_to_check = [2, n_layers // 2, n_layers - 2]
+        indices_to_check = [2, n_sublayers // 2, n_sublayers - 2]
         labels = ["EARLY (Attn Layer 1)", "MIDDLE (Attn Layer ~6)", "LATE (Attn Layer ~10)"]
 
         torch.set_printoptions(precision=3, sci_mode=False, linewidth=160)
@@ -1941,8 +1888,9 @@ if master_process:
         for idx, label in zip(indices_to_check, labels):
             print0(f"\n--- {label} (Sublayer Index {idx}) ---", console=True)
 
-            pre_weights = w_pre[idx].squeeze()
-            print0(f"  [H_pre] Lane Reads: {pre_weights.numpy()}", console=True)
+            # H_pre is frozen round-robin: even→lane0, odd→lane1
+            pre_str = "[1, 0]" if idx % 2 == 0 else "[0, 1]"
+            print0(f"  [H_pre] Lane Reads: {pre_str} (frozen round-robin)", console=True)
 
             post_weights = w_post[idx].squeeze()
             print0(f"  [H_post] Write Strength: {post_weights.numpy()}", console=True)
@@ -1953,12 +1901,8 @@ if master_process:
             print0(f"  [bigram_bias] Injection per Lane: {xb_b.numpy()}", console=True)
             print0(f"  [resid_lambda] Gain: {resid_lambda[idx].item():.4f}", console=True)
 
-            res_matrix = w_res[idx]
-            print0(f"  [H_res] Mixing Matrix:\n{res_matrix.numpy()}", console=True)
-
-            identity_init = torch.eye(n_lanes)
-            drift = (res_matrix - identity_init).abs().mean()
-            print0(f"  > Matrix Drift from Identity: {drift:.4f}", console=True)
+            # H_res is frozen identity
+            print0(f"  [H_res] Mixing Matrix: identity (frozen)", console=True)
 
     print0("="*80 + "\n", console=True)
 
