@@ -1005,22 +1005,6 @@ class Block(nn.Module):
             x = x + self.mlp(norm(x), c_fc, c_proj)
         return x
 
-    def forward_hc(self, lane0, lane1, attn_args, qkvo_w, c_fc, c_proj,
-                   rl_a, wp0_a, wp1_a, xb0_a, xb1_a, bb0_a, bb1_a,
-                   rl_m, wp0_m, wp1_m, xb0_m, xb1_m, bb0_m, bb1_m,
-                   x0, x0_bigram):
-        skip_val = None
-        if self.attn is not None:
-            h = self.attn(norm(lane0), attn_args, qkvo_w)
-            lane0 = rl_a * lane0 + h * wp0_a + x0 * xb0_a + x0_bigram * bb0_a
-            lane1 = rl_a * lane1 + h * wp1_a + x0 * xb1_a + x0_bigram * bb1_a
-            skip_val = lane0
-        if self.mlp is not None:
-            h = self.mlp(norm(lane1), c_fc, c_proj)
-            lane0 = rl_m * lane0 + h * wp0_m + x0 * xb0_m + x0_bigram * bb0_m
-            lane1 = rl_m * lane1 + h * wp1_m + x0 * xb1_m + x0_bigram * bb1_m
-        return lane0, lane1, skip_val
-
 # -----------------------------------------------------------------------------
 # The main model
 
@@ -1213,6 +1197,10 @@ class GPT(nn.Module):
         # Initialize 2-lane residual stream with pre-layer-0 bigram injection
         lane0 = x0 + x0_bigram * bb0[0]
         lane1 = x0 + x0_bigram * bb1[0]
+        # Zero out sublayer-0 bigram to avoid double injection in the loop
+        zero = bb0[0] * 0
+        bb0 = (zero,) + bb0[1:]
+        bb1 = (zero,) + bb1[1:]
 
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]

@@ -295,6 +295,23 @@ would improve if attention+residual are in the same function scope.
 **Result:** val_loss=**3.2766** @ 1540 steps (num_scheduled_iterations=1500), step_avg=**487ms**.
 SLOWER than inline approach (470ms). Function boundaries don't help torch.compile. Reverted to inline.
 
+## Exp 30: Clean refactored code, 1540 steps
+**Config:** Cleaned up code: removed dead forward_hc method, removed frozen buffers, short var names,
+inline HC forward. Fixed double-bigram bug at sublayer 0 (refactor dropped `if idx > 0` guard).
+num_scheduled_iterations=1500 (1540 total).
+**Result:** val_loss=**3.2776** @ 1540, step_avg=**465ms**. Does NOT beat baseline (3.2769).
+Pre-refactor code got 3.2765 at same step count — 0.0011 gap is likely run-to-run variance.
+```
+step:0/1540    val_loss:10.8303
+step:250/1540  val_loss:4.5489  step_avg:259ms
+step:500/1540  val_loss:4.2274  step_avg:256ms
+step:750/1540  val_loss:3.8582  step_avg:321ms
+step:1000/1540 val_loss:3.5618  step_avg:354ms
+step:1250/1540 val_loss:3.3922  step_avg:417ms
+step:1500/1540 val_loss:3.2890  step_avg:459ms
+step:1540/1540 val_loss:3.2776  step_avg:465ms
+```
+
 ---
 
 ## Performance Analysis: AB Test (HC Overhead Isolation)
