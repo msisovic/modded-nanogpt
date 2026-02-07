@@ -114,3 +114,27 @@ Less memory overhead may also help training.
 **Hypothesis:** Exp 7b showed 2-lane cumulative gain ≈ 0.95 (near neutral).
 With only 2 lanes, the model may not need explicit gain since w_res stays closer to identity.
 Fewer learnable params = cleaner optimization. If this matches 7b, resid_lambda isn't needed.
+
+## Exp 9: Reproduce Exp 7b on single H200 (nproc=1)
+**Config:** Faithful Exp 7b reproduction (2 lanes + resid_lambda sqrt(1.1))
+- n_lanes=2, w_res=I_2, round-robin pre, flat post=1.0
+- resid_lambda: sqrt(1.1) per sublayer, lr_mul=5.0, adam_betas=[0.9, 0.99]
+- x0_bias: lr_mul=1.0, bigram_bias: lr_mul=1.0
+- HC matrices (res/pre/post): lr_mul=1.0
+- Single GPU (nproc_per_node=1), grad_accum_steps=8
+
+**Result:** val_loss=**3.2734** @ 1600. **BEATS BASELINE** (3.2769) by 0.0035!
+```
+step:250/1600  val_loss:4.5792  step_avg:268ms
+step:500/1600  val_loss:4.2458  step_avg:267ms
+step:750/1600  val_loss:3.8984  step_avg:336ms
+step:1000/1600 val_loss:3.5918  step_avg:375ms
+step:1250/1600 val_loss:3.4131  step_avg:503ms
+step:1500/1600 val_loss:3.3033  step_avg:585ms
+step:1600/1600 val_loss:3.2734  step_avg:609ms
+```
+**HC Analysis:**
+- Late layer: w_post=[1.80, 1.66] (high write strength), matrix drift=0.107
+- Middle: resid_lambda=0.87, pre learned to mix both lanes [0.29, 0.92]
+- Late: resid_lambda=0.78, pre flipped signs [-0.40, 0.39] (creative routing!)
+- Strong lane specialization throughout
