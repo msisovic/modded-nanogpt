@@ -192,3 +192,13 @@ step:1600/1600 val_loss:3.2720
 ```
 Pattern: frozen w_res + frozen w_pre + learned w_post = sweet spot.
 Fewer HC params = more optimizer capacity for the params that matter.
+
+## Exp 18: w_post lr_mul 1.0→5.0
+**Config:** Exp 17 + w_post lr_mul increased from 1.0 to 5.0
+**Hypothesis:** w_post is the most important learned HC param. Faster learning might help.
+**Result:** val_loss=**3.2723** @ 1600. Nearly identical to Exp 17 (3.2720). No benefit. Reverted to lr_mul=1.0.
+
+## Exp 19: Learned output weights (lane combination)
+**Config:** Exp 17 + learned `hyper_output_w` per-lane scalar for final output (init 0.5 each)
+**Hypothesis:** Equal lane averaging may not be optimal. Let model learn output weighting.
+**Result:** val_loss=**3.2750** @ 1600. Worse than Exp 17. Equal averaging is fine. Reverted.
