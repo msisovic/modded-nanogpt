@@ -229,3 +229,19 @@ step:1555/1555 val_loss:3.2745  step_avg:509ms
 ```
 HC still works on new baseline. Margin reduced from -0.0049 (old) to -0.0024 (new),
 partly because we have 45 fewer steps (1555 vs 1600).
+
+## Exp 21: Match x0_bias/bigram_bias optimizer to baseline (adam_betas=[0.65,0.95], lr_mul=5.0)
+**Config:** Exp 20 + hyper_x0_bias adam_betas [0.9,0.99]→[0.65,0.95], lr_mul 1.0→5.0;
+hyper_bigram_bias lr_mul 1.0→5.0
+**Result:** val_loss=**3.2785** @ 1555. Worse than Exp 20 (3.2745). Faster optimizer settings hurt.
+Consistent with old findings (Exp 4, 10). Reverted.
+
+## Exp 22: Remove hyper_bigram_bias, restore baseline bigram_lambdas in scalars
+**Config:** Exp 20 but bigram contribution from per-layer scalars instead of per-sublayer HC param
+**Result:** KILLED at step 1000 (val_loss=3.7700). Catastrophically worse. Per-sublayer bigram
+granularity is critical. Reverted.
+
+## Exp 22b: Replace hyper_x0_bias with baseline x0_lambdas (per-layer)
+**Config:** Exp 20 but x0 contribution from per-layer x0_lambdas (baseline adam_betas/lr_mul)
+instead of per-sublayer per-lane hyper_x0_bias.
+**Result:** KILLED at step 250 (val_loss=4.7388 vs Exp 20's 4.5614). Much worse. Reverted.
