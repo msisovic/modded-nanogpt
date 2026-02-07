@@ -1190,12 +1190,15 @@ class GPT(nn.Module):
         backout_lambda = self.scalars[2 * self.num_layers + 1]
         skip_lambda = self.scalars[2 * self.num_layers + 2]
 
-        # unbind hyper weights to avoid select_backwards kernel (cast to bfloat16 to match activations)
-        hyper_w_pre = self.hyper_w_pre.bfloat16().unbind(0)
-        hyper_w_res = self.hyper_w_res.bfloat16().unbind(0)
-        hyper_w_post = self.hyper_w_post.bfloat16().unbind(0)
-        hyper_x0_bias = self.hyper_x0_bias.bfloat16().unbind(0)
-        hyper_bigram_bias = self.hyper_bigram_bias.bfloat16().unbind(0)
+        # unbind learned hyper weights to avoid select_backwards kernel (cast to bfloat16)
+        # w_pre (frozen one-hot) and w_res (frozen identity) replaced with explicit scalar ops below
+        # Split per-lane scalars for explicit scalar multiplication (no 4D broadcasting)
+        hyper_w_post_0 = self.hyper_w_post[:, 0, 0].bfloat16().unbind(0)
+        hyper_w_post_1 = self.hyper_w_post[:, 1, 0].bfloat16().unbind(0)
+        hyper_x0_bias_0 = self.hyper_x0_bias[:, 0, 0].bfloat16().unbind(0)
+        hyper_x0_bias_1 = self.hyper_x0_bias[:, 1, 0].bfloat16().unbind(0)
+        hyper_bigram_bias_0 = self.hyper_bigram_bias[:, 0, 0].bfloat16().unbind(0)
+        hyper_bigram_bias_1 = self.hyper_bigram_bias[:, 1, 0].bfloat16().unbind(0)
         hyper_resid_lambda = self.hyper_resid_lambda.bfloat16().unbind(0)
 
         # set block masks and key shift
@@ -1218,14 +1221,14 @@ class GPT(nn.Module):
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
-        # Initialize x_lanes: (B, S, n_lanes, D) - all lanes start with x0
-        x_lanes = x0.unsqueeze(2).expand(-1, -1, self.n_lanes, -1).clone()
+        # Initialize two separate (B, S, D) lane tensors — no 4D overhead
+        lane0 = x0.clone()
+        lane1 = x0.clone()
 
         # --- Layer 0 Pre-Injection ---
         # Baseline adds bigram BEFORE block 0 runs. We must do the same.
-        # Use the LEARNABLE parameter for sublayer 0 (skipped in loop to avoid double-add)
-        # hyper_bigram_bias[0]: [n_lanes, 1] -> broadcast to [B, T, n_lanes, D]
-        x_lanes = x_lanes + (x0_bigram.unsqueeze(2) * hyper_bigram_bias[0].view(1, 1, self.n_lanes, 1))
+        lane0 = lane0 + x0_bigram * hyper_bigram_bias_0[0]
+        lane1 = lane1 + x0_bigram * hyper_bigram_bias_1[0]
 
         # unbind gate banks to avoid select_backwards kernel
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
@@ -1263,7 +1266,9 @@ class GPT(nn.Module):
             # Skip-out connection (layer 6 has no attention, so handle before sublayers)
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
-                x_lanes = x_lanes + skip_gate_out.unsqueeze(2) * skip_connections.pop().unsqueeze(2)
+                skip_val = skip_connections.pop()
+                lane0 = lane0 + skip_gate_out * skip_val
+                lane1 = lane1 + skip_gate_out * skip_val
 
             # ==========================================
             # STEP 1: ATTENTION SUBLAYER (Index 2*i)
@@ -1271,33 +1276,20 @@ class GPT(nn.Module):
             if block.attn is not None:
                 idx = 2 * i
 
-                # 1. PRE-MIX
-                w_pre = hyper_w_pre[idx].squeeze(0)
-                x_agg = sum(x_lanes[:, :, l] * w_pre[l] for l in range(self.n_lanes))
+                # 1. PRE-MIX: even sublayers read lane 0
+                h = block.attn(norm(lane0), attn_args, qkvo_w)
 
-                # 2. RUN ATTENTION
-                h = block.attn(norm(x_agg), attn_args, qkvo_w)
-
-                # 3. RESIDUAL UPDATE with resid_lambda gain
-                w_res = hyper_w_res[idx]
-                w_post = hyper_w_post[idx]
-                x0_b = hyper_x0_bias[idx]
-                xb_b = hyper_bigram_bias[idx]
+                # 2. RESIDUAL UPDATE: w_res=identity, explicit scalar mults per lane
                 rl = hyper_resid_lambda[idx]
-
-                new_lanes = []
-                for o in range(self.n_lanes):
-                    lane_o = rl * sum(x_lanes[:, :, l] * w_res[o, l] for l in range(self.n_lanes))
-                    lane_o = lane_o + h * w_post[o, 0]
-                    lane_o = lane_o + (x0 * x0_b[o, 0])
-                    if idx > 0:
-                        lane_o = lane_o + (x0_bigram * xb_b[o, 0])
-                    new_lanes.append(lane_o)
-                x_lanes = torch.stack(new_lanes, dim=2)
+                lane0 = rl * lane0 + h * hyper_w_post_0[idx] + x0 * hyper_x0_bias_0[idx]
+                lane1 = rl * lane1 + h * hyper_w_post_1[idx] + x0 * hyper_x0_bias_1[idx]
+                if idx > 0:
+                    lane0 = lane0 + x0_bigram * hyper_bigram_bias_0[idx]
+                    lane1 = lane1 + x0_bigram * hyper_bigram_bias_1[idx]
 
             # Skip-in connection (after attention sublayer)
             if i in skip_in:
-                skip_connections.append(x_lanes[:, :, 0])
+                skip_connections.append(lane0)
 
             # ==========================================
             # STEP 2: MLP SUBLAYER (Index 2*i + 1)
@@ -1305,33 +1297,19 @@ class GPT(nn.Module):
             if block.mlp is not None:
                 idx = 2 * i + 1
 
-                # 1. PRE-MIX
-                w_pre = hyper_w_pre[idx].squeeze(0)
-                x_agg = sum(x_lanes[:, :, l] * w_pre[l] for l in range(self.n_lanes))
+                # 1. PRE-MIX: odd sublayers read lane 1
+                h = block.mlp(norm(lane1), c_fc, c_proj)
 
-                # 2. RUN MLP
-                h = block.mlp(norm(x_agg), c_fc, c_proj)
-
-                # 3. RESIDUAL UPDATE with resid_lambda gain
-                w_res = hyper_w_res[idx]
-                w_post = hyper_w_post[idx]
-                x0_b = hyper_x0_bias[idx]
-                xb_b = hyper_bigram_bias[idx]
+                # 2. RESIDUAL UPDATE: w_res=identity, explicit scalar mults per lane
                 rl = hyper_resid_lambda[idx]
-
-                new_lanes = []
-                for o in range(self.n_lanes):
-                    lane_o = rl * sum(x_lanes[:, :, l] * w_res[o, l] for l in range(self.n_lanes))
-                    lane_o = lane_o + h * w_post[o, 0]
-                    lane_o = lane_o + (x0 * x0_b[o, 0]) + (x0_bigram * xb_b[o, 0])
-                    new_lanes.append(lane_o)
-                x_lanes = torch.stack(new_lanes, dim=2)
+                lane0 = rl * lane0 + h * hyper_w_post_0[idx] + x0 * hyper_x0_bias_0[idx] + x0_bigram * hyper_bigram_bias_0[idx]
+                lane1 = rl * lane1 + h * hyper_w_post_1[idx] + x0 * hyper_x0_bias_1[idx] + x0_bigram * hyper_bigram_bias_1[idx]
 
             if i == backout_layer:
-                x_backout = x_lanes[:, :, 0]
+                x_backout = lane0
 
-        # Final output: average all lanes
-        x = sum(x_lanes[:, :, l] for l in range(self.n_lanes)) * (1.0 / self.n_lanes)
+        # Final output: average both lanes
+        x = (lane0 + lane1) * 0.5
 
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
         x = x - backout_lambda * x_backout

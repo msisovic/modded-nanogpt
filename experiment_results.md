@@ -261,12 +261,38 @@ of x0_bias/bigram_bias is valuable. Reverted.
 x0 contribution = (x0_lambdas[i] + x0_bias[o]) * x0. Two signals: per-layer coarse + per-sublayer per-lane fine.
 **Result:** val_loss=**3.2796** @ 1555. Worse than Exp 20. Redundant x0 signals interfere. Reverted.
 
+## Exp 26: Vectorized 4D broadcast (optimize step time, attempt 1)
+**Config:** Exp 20 but forward pass rewritten: eliminated Python loops, used 4D tensor broadcasting
+with `h.unsqueeze(2) * w_post.view(1,1,2,1)` pattern. Removed w_pre/w_res unbinding.
+**Result:** val_loss=**3.2731** @ 1555, step_avg=**614ms** (WORSE than 509ms!).
+Broadcasting created expensive 4D intermediates that hurt torch.compile fusion. Reverted approach.
+
+## Exp 27: Explicit scalar mults with separate lane tensors (optimize step time, attempt 2)
+**Config:** Exp 20 forward pass rewritten: two separate (B,S,D) tensors (`lane0`, `lane1`)
+instead of one (B,S,2,D) `x_lanes`. All operations are scalar-tensor multiplies on 3D tensors.
+No 4D broadcasting, no unsqueeze, no torch.stack. Pre-split per-lane scalars via unbind.
+**Result:** val_loss=**3.2746** @ 1555, step_avg=**468ms** (down from 509ms, **8% faster**).
+```
+step:0/1555    val_loss:10.8291
+step:250/1555  val_loss:4.5551  step_avg:279ms
+step:500/1555  val_loss:4.2529  step_avg:274ms
+step:750/1555  val_loss:3.8619  step_avg:332ms
+step:1000/1555 val_loss:3.5651  step_avg:361ms
+step:1250/1555 val_loss:3.3933  step_avg:419ms
+step:1500/1555 val_loss:3.2908  step_avg:460ms
+step:1555/1555 val_loss:3.2746  step_avg:468ms
+```
+HC crosses baseline loss (3.2768) around step ~1548. Still 2.13x overhead vs baseline (220ms).
+
 ---
 ### Summary of Post-Merge Experiments
-**Baseline:** 3.2768 @ 1555 steps (measured)
-**Best HC:** Exp 20 = 3.2745 @ 1555 steps (**-0.0023**)
-All modifications to Exp 20 config have been worse. The config is at a local optimum:
+**Baseline:** 3.2768 @ 1555 steps, step_avg=220ms
+**Best HC:** Exp 20 = 3.2745 @ 1555 steps (**-0.0023**, step_avg=509ms)
+**Fastest HC:** Exp 27 = 3.2746 @ 1555 steps (**-0.0022**, step_avg=468ms, 2.13x overhead)
+
+All modifications to Exp 20 val_loss config have been worse. The config is at a local optimum:
 - Frozen w_res (identity), frozen w_pre (round-robin one-hot)
 - Learned w_post, x0_bias, bigram_bias (per-sublayer per-lane)
 - Learned resid_lambda (per-sublayer, init sqrt(1.1))
 - All HC params: adam_betas=[0.9, 0.99], lr_mul=1.0 (except resid_lambda lr_mul=5.0)
+- Forward pass: separate lane0/lane1 tensors with explicit scalar mults (Exp 27)
