@@ -1,14 +1,16 @@
 # Hyper-Connections Experiment Log
 
-**Baseline (master, no HC):** val_loss=3.2769 @ 1600 steps
-**Previous best HC:** val_loss=3.2809 (4 lanes, post-apply, identity init, flat post=1.0)
+**NEW Baseline (master, post-merge):** val_loss=3.2769 @ 1555 steps (1515 scheduled + 40 extension)
+**Old Baseline (pre-merge):** val_loss=3.2769 @ 1600 steps
+**Best HC (Exp 17, old baseline):** val_loss=3.2720 @ 1600 steps
 
 ---
 
-# Hyper-Connections Experiment Log
-
-**Baseline (master, no HC):** val_loss=3.2769 @ 1600 steps
-**Previous best HC:** val_loss=3.2809 (4 lanes, post-apply, identity init, flat post=1.0)
+> **NOTE (Baseline Change):** Experiments 1-19 below were run against the OLD baseline
+> (3.2769 @ 1600 steps). The master branch was updated with new improvements (single value
+> embedding weight, mimetic init, x0_lambdas separation, Yarn refactor, 1555 steps).
+> These old results are **outdated** — the step count was higher (1600 vs 1555) and the
+> code base has changed. Experiments 20+ use the NEW merged baseline.
 
 ---
 
