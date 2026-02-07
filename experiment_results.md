@@ -245,3 +245,13 @@ granularity is critical. Reverted.
 **Config:** Exp 20 but x0 contribution from per-layer x0_lambdas (baseline adam_betas/lr_mul)
 instead of per-sublayer per-lane hyper_x0_bias.
 **Result:** KILLED at step 250 (val_loss=4.7388 vs Exp 20's 4.5614). Much worse. Reverted.
+
+## Exp 23: Lower resid_lambda init (1.02 vs sqrt(1.1))
+**Config:** Exp 20 but resid_lambda init 1.02 per sublayer (cumulative ~1.55) instead of sqrt(1.1) (~2.78)
+**Result:** val_loss=**3.2794** @ 1555. Worse than Exp 20. sqrt(1.1) init remains optimal. Reverted.
+
+## Exp 24: Scalar x0_bias and bigram_bias (shared across lanes)
+**Config:** Exp 20 but x0_bias and bigram_bias are per-sublayer scalars (not per-lane).
+Reduces HC params from 44+44 to 22+22. Same optimizer settings.
+**Result:** val_loss=**3.2811** @ 1555. Worse than Exp 20 (3.2745). Per-lane specialization
+of x0_bias/bigram_bias is valuable. Reverted.
