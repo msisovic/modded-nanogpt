@@ -138,3 +138,31 @@ step:1600/1600 val_loss:3.2734  step_avg:609ms
 - Middle: resid_lambda=0.87, pre learned to mix both lanes [0.29, 0.92]
 - Late: resid_lambda=0.78, pre flipped signs [-0.40, 0.39] (creative routing!)
 - Strong lane specialization throughout
+
+## Exp 10: x0_bias and bigram_bias lr_mul 1.0→5.0
+**Config:** Exp 9 + faster learning for x0_bias and bigram_bias
+**Result:** val_loss=**3.2810** @ 1600. Worse. Overshoot—x0_bias grew to 1.15/-2.23. Reverted.
+
+## Exp 11: Lane average for skip_in and backout
+**Config:** Exp 9 + skip_in/backout use lane average instead of lane 0
+**Result:** val_loss=**3.2838** @ 1600. Worse. Reverted.
+
+## Exp 12: Lower resid_lambda init (1.0 vs sqrt(1.1))
+**Config:** Exp 9 but resid_lambda init 1.0 (neutral) instead of sqrt(1.1)
+**Result:** val_loss=**3.2828** @ 1600. Worse. sqrt(1.1) init is better. Reverted.
+
+## Exp 13: Frozen w_res (identity buffer, not learned)
+**Config:** Exp 9 but w_res is a fixed buffer (identity), removed from optimizer
+**Hypothesis:** w_res only achieves 0.03-0.11 drift in 1600 steps. Learning it wastes
+optimizer capacity. Freezing it lets pre/post/resid_lambda learn more effectively.
+**Result:** val_loss=**3.2727** @ 1600. **NEW BEST!** Beats baseline by 0.0042.
+```
+step:250/1600  val_loss:4.5867
+step:500/1600  val_loss:4.2304
+step:750/1600  val_loss:3.8829  ← beats baseline 3.8985 by 0.016!
+step:1000/1600 val_loss:3.5884
+step:1250/1600 val_loss:3.4105
+step:1500/1600 val_loss:3.3019
+step:1600/1600 val_loss:3.2727
+```
+Cumulative resid_lambda gain: 0.1236 (heavy decay). Fewer params = better convergence.
