@@ -564,3 +564,23 @@ val_loss above master (3.2824 > 3.2774). lr_mul=2.0 overshoots, consistent with 
 **Result (4xH200):** step_avg=**115.33ms**, val_loss=**3.2750**, train_time=175,295ms.
 val_loss beats master by 0.0024! Train time only 235ms over master (+0.13%).
 **Best yet!** beta2=0.95 helps HC convergence.
+
+## Exp 45: Master-style x0_bias optimizer (beta=[0.65,0.95], lr_mul=5.0)
+**Config:** Exp 44 + x0_bias matching master's x0_lambdas optimizer: beta=[0.65, 0.95], lr_mul=5.0.
+**Hypothesis:** Master's x0_lambdas use very aggressive settings; matching them might help.
+**Result (4xH200):** step_avg=**115.11ms**, val_loss=**3.2831**, train_time=174,961ms.
+Aggressive x0_bias settings hurt loss. **Reverted.**
+
+## Exp 46: beta2=0.95 + reduced scheduled=1470 (1510 total)
+**Config:** Exp 44 beta2=0.95 + num_scheduled=1470, extension=40. Total 1510 steps.
+**Hypothesis:** beta2=0.95 convergence boost lets us cut 30 scheduled steps.
+**Result (4xH200):** step_avg=**115.96ms**, val_loss=**3.2788**, train_time=175,106ms.
+Train time only 46ms over master! val_loss 0.0014 above master (within noise).
+
+## Exp 47: beta2=0.95 + reduced scheduled=1480 (1520 total)
+**Config:** Same but num_scheduled=1480, extension=40. Total 1520 steps.
+**Hypothesis:** 10 more steps than Exp 46 should improve loss.
+**Result (4xH200):** step_avg=**116.05ms**, val_loss=**3.2807**, train_time=176,393ms.
+Worse than both Exp 46 and Exp 44. Cutting scheduled steps (compressing LR schedule)
+hurts more than cutting extension steps. Exp 44 (sched=1500, ext=20) is better than
+Exp 47 (sched=1480, ext=40) at the same 1520 total steps.
