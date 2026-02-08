@@ -701,3 +701,115 @@ Beats master by 160ms. Same loss as 1470-sched configs.
 
 Verification runs of sched=1470 config: 3.2788, 3.2788, 3.2792 → avg 3.2789 (robust).
 val_loss gap (0.0015-0.0018) is within single-run noise (+-0.003).
+
+---
+## Overhead Analysis: Master Precompute Result Challenges "Memory Bandwidth" Hypothesis
+
+### Key Finding
+The same precompute-outside-loop optimization was applied to master's residual update
+(`x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram`).
+On master, it **added** +0.98ms/step (regression). See `msisovic/precompute-bias` branch.
+
+| Version | step_avg (2-run avg) | Delta |
+|---------|---------------------|-------|
+| Master baseline | 112.22ms | — |
+| Master + precompute | 113.20ms | **+0.98ms (slower!)** |
+| HC baseline (Exp 36) | 115.84ms | +3.62ms vs master |
+| HC + precompute (Exp 33) | 117.96ms → 115.84ms | -1.2ms (helped) |
+
+### Why Precompute Helps HC but Hurts Master
+**Master:** torch.compile fuses `resid * x + x0_lambda * x0 + bigram * x0_bigram` into a
+single kernel. Precomputing BREAKS this fusion (bias materialized to memory, then loaded back).
+**HC:** The 4 lane updates per layer (2 lanes × 2 sublayers) create a longer backward
+critical path. Precomputing moves x0/bigram gradient computation OFF this path.
+
+### What This Tells Us About the HC Overhead
+The ~3.6ms/step gap is NOT simply "2 lanes = 2× memory bandwidth." If it were, precomputing
+would also help master (since it reduces memory ops). The real overhead comes from:
+
+**1. Longer backward critical path (primary)**
+HC has 4 sequential lane updates per layer (attn-lane0, attn-lane1, mlp-lane0, mlp-lane1).
+Each update creates a new dependency node in the backward graph. Master has just 2 simple
+additions per layer (x += attn_out, x += mlp_out) inside a single compiled Block.forward().
+
+**2. More scalar gradient reductions (secondary)**
+HC: 6 scalar reductions per layer × 11 layers = 66 reductions (rl, wp0, wp1 for attn+MLP)
+Master: 3 scalar reductions per layer × 11 layers = 33 reductions
+Each reduction sums a (1,2048,1024) tensor. Extra 33 reductions ≈ 0.5-1.0ms.
+
+**3. Breaking Block compilation unit (structural)**
+Master calls `self.blocks[i](x, ...)` — a single function where attn+residual+MLP+residual
+are compiled together. HC calls `block.attn(...)` and `block.mlp(...)` separately with
+explicit lane updates between them. While fullgraph=True traces everything, the lane
+updates between attn and MLP may prevent certain kernel fusions.
+
+### Optimization Implications
+The overhead is NOT from simple memory bandwidth but from backward pass complexity.
+Potential approaches:
+- Reduce the number of sequential lane updates (e.g., attn writes only to lane0, MLP only to lane1)
+- Merge the 2 lane updates per sublayer into fewer operations
+- Further reduce scalar parameters (fewer gradient reductions)
+
+---
+
+## Exp 68: No cross-lane writes (attn→lane0 only, MLP→lane1 only)
+**Config:** Remove all cross-lane writes entirely. Attn only updates lane0, MLP only updates lane1.
+No rl, no wp, no bias on the "other" lane. Isolates cross-lane overhead.
+**Result (4xH200):** step_avg=**113.65ms**, val_loss=**3.5142**, train_time=175,099ms.
+Loss completely broken — confirms cross-lane writes are essential for HC quality.
+**Key finding:** Cross-lane writes account for ~2.19ms of ~3.6ms total HC overhead (113.65 vs 115.84).
+
+## Exp 69: Simplified cross-lane (no rl, no bias on cross-lane)
+**Config:** Keep cross-lane writes but simplify: attn cross-lane = `lane1 += h * wp1[si]` (no rl, no bias).
+MLP cross-lane = `lane0 += h * wp0[si+1]` (no rl, no bias). Home lane keeps full rl + wp + bias.
+**Result (4xH200):** step_avg=**114.57ms**, val_loss=**3.2777**, train_time=176,563ms.
+Saves 1.27ms/step vs full HC. Loss borderline (0.0003 above master). The rl scalar on cross-lane
+is the expensive part, not the bias addition.
+
+## Exp 70: Cross-lane with rl but no bias
+**Config:** Cross-lane writes include rl but no bias: `lane1 = rl[si] * lane1 + h * wp1[si]`.
+Tests whether bias or rl is responsible for cross-lane overhead.
+**Result (4xH200):** step_avg=**115.86ms**, val_loss=similar to full HC.
+Same speed as full HC — confirms **rl is the expensive part** (scalar gradient reductions), not bias.
+
+## Exp 71: Merge-before-MLP (merge lanes before MLP, split after)
+**Config:** Before MLP sublayer, merge lanes: `merged = (lane0 + lane1) * 0.5`, run MLP on merged,
+then split back to lanes. Reduces sequential lane updates.
+**Result (4xH200):** step_avg=**115.15ms**, val_loss=**3.3659**, train_time=~177k ms.
+Loss broken — merging destroys lane-specific information.
+
+## Exp 72: No-rl cross-lane + 1555 steps (compensate with more training)
+**Config:** Exp 69 config (simplified cross-lane, no rl) + sched=1500, ext=55 (1555 total steps).
+Adds 15 extra steps to compensate for loss penalty.
+**Result (4xH200):** step_avg=**114.57ms**, val_loss=**3.2767**, train_time=178,908ms.
+Loss recovered but extra steps negate the speed benefit (178,908 > 175,060ms master).
+
+---
+### Cross-Lane Write Analysis Summary (Exps 68-72)
+| Config | step_avg | val_loss | vs full HC |
+|--------|----------|----------|------------|
+| Full HC (Exp 36) | 115.84ms | 3.2755 | baseline |
+| No cross-lane (Exp 68) | 113.65ms | 3.5142 | -2.19ms, loss broken |
+| **No-rl cross-lane (Exp 69)** | **114.57ms** | **3.2777** | **-1.27ms, borderline loss** |
+| rl + no bias cross-lane (Exp 70) | 115.86ms | ~same | +0.02ms, same speed |
+| Merge-before-MLP (Exp 71) | 115.15ms | 3.3659 | -0.69ms, loss broken |
+| No-rl + extra steps (Exp 72) | 114.57ms | 3.2767 | -1.27ms, but +3.9s wall |
+
+**Conclusion:** The rl scalar multiplication on cross-lane updates accounts for ~1.3ms of overhead
+(via scalar gradient reductions in backward). Removing it saves per-step time but costs ~0.002 loss,
+and adding steps to compensate negates the wall-time gain. The full cross-lane config remains optimal.
+
+---
+
+## 5-Run Reliability Test: beta2=0.95, sched=1500, ext=40 (1540 total)
+Full HC config with adam_betas=[0.9, 0.95] for all HC params.
+| Run | val_loss |
+|-----|----------|
+| 1 | 3.2772 |
+| 2 | 3.2776 |
+| 3 | 3.2760 |
+| 4 | 3.2760 |
+| 5 | 3.2760 |
+| **Avg** | **3.2766** |
+
+4/5 runs under 3.277. Run 2 barely missed at 3.2776. Need a small margin improvement.

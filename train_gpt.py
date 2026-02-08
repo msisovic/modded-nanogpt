@@ -1201,7 +1201,7 @@ class GPT(nn.Module):
         bb0 = (zero,) + bb0[1:]
         bb1 = (zero,) + bb1[1:]
 
-        # Precompute bias terms for attn sublayers only (MLP sublayers use rl*lane + h*wp without bias)
+        # Precompute bias terms outside loop (moves x0/bigram gradient computation off backward critical path)
         hc_bias0 = tuple(x0 * xb0[2*i] + x0_bigram * bb0[2*i] for i in range(self.num_layers))
         hc_bias1 = tuple(x0 * xb1[2*i] + x0_bigram * bb1[2*i] for i in range(self.num_layers))
 
@@ -1458,7 +1458,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1465  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1500  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
