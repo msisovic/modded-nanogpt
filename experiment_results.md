@@ -544,3 +544,10 @@ What doesn't work (remaining 3.26ms gap):
 The residual 2.9% overhead maps to the irreducible memory bandwidth cost of maintaining
 2 lane tensors. On a larger cluster (8x GPUs), communication becomes a larger fraction
 of step time, reducing HC's relative overhead to ~1-2% where it would likely break even.
+
+## Exp 42: Reduce extension from 40→20 (1520 total steps)
+**Config:** Exp 36 + num_extension_iterations=20 (was 40). Total steps: 1520 (was 1540).
+**Hypothesis:** HC converges during the scheduled 1500 steps; the extension phase can be shorter.
+**Result (4xH200):** step_avg=**115.39ms**, val_loss=**3.2771**, train_time=175,394ms.
+val_loss BEATS master (3.2771 < 3.2774)! Train time only 334ms over master (+0.19%).
+**Nearly wall-time parity.** The last 20 extension steps contributed negligible improvement.
