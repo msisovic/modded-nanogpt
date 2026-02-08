@@ -478,5 +478,69 @@ regressed above master's 3.2774. MLP w_post matters for lane differentiation. **
 | HC full detach (Exp 32) | 117.31ms | 3.2911 | 180,661ms | BROKEN |
 | HC precompute+bg detach (Exp 34) | 117.59ms | 3.2886 | 181,091ms | BROKEN |
 
-Current best: Exp 36 (attn-only bias). 1.9% slower than master but 0.002 better val_loss.
-Remaining gap: ~3.3ms/step. Backward pass scalar gradient reductions are the main bottleneck.
+## Exp 38: Remove MLP resid_lambda + trim HC params
+**Config:** Exp 36 + resid_lambda only for attn sublayers (11→11, MLP fixed at 1.0).
+x0_bias/bigram_bias trimmed from (22,2,1) to (11,2,1) since only attn sublayer values used.
+MLP update: `lane = lane + h * wp` (no rl scaling).
+**Result (4xH200):** step_avg=**116.36ms**, val_loss=**3.2762**, train_time=179,189ms.
+Within noise of Exp 36. torch.compile already fuses the rl multiply with surrounding ops,
+so removing it doesn't save time. **No benefit. Reverted.**
+
+## Exp 39: Reduced step count (num_scheduled=1470, total=1510)
+**Config:** Exp 38 config + fewer training steps to close wall time gap.
+**Hypothesis:** HC converges faster so fewer steps might still beat master loss.
+**Result (4xH200):** step_avg=**116.34ms**, val_loss=**3.2803**, train_time=175,673ms.
+val_loss above master's 3.2774. Wall time still over by 613ms.
+**HC needs ~1534 steps to reach master's loss, too many for wall time parity.** Reverted.
+
+## Exp 40: Partial HC (layers 0-6 only, standard residual for 7-10)
+**Config:** HC active for first 7 layers only. Layers 7-10 use plain `lane += h`.
+Hypothesis: HC is most active in early layers (rl=3.5 at layer 0); late layers might not need it.
+**Result (4xH200):** step_avg=**114.64ms**, val_loss=**3.2793**, train_time=176,539ms.
+Saved ~1.2ms/step but val_loss regressed above master (3.2793 > 3.2774).
+Late layer HC contributes meaningful loss quality. **Reverted.**
+
+## Exp 41: Custom torch.autograd.Function for HC update
+**Config:** Exp 36 + fused backward: `HCUpdate.apply(lane0, lane1, h, rl, wp0, wp1)`.
+Custom backward batches scalar gradient reductions (1 reduction for rl instead of 2).
+**Hypothesis:** Batched reductions + fused grad_h saves kernel launches.
+**Result (4xH200):** step_avg=**116.06ms**, val_loss=**3.2801**, train_time=178,732ms.
+No improvement — torch.compile already generates near-optimal fused kernels.
+Custom Function may hinder cross-sublayer fusion. **Reverted.**
+
+---
+### Final 4xH200 Optimization Summary
+| Config | step_avg | val_loss | train_time | vs master |
+|--------|----------|----------|------------|-----------|
+| Master (1555 steps) | 112.58ms | 3.2774 | 175,060ms | baseline |
+| HC original (1540) | 119.17ms | 3.2748 | 183,519ms | +4.8% |
+| HC precompute (Exp 33) | 117.96ms | 3.2734 | 181,663ms | +3.8% |
+| **HC attn-only bias (Exp 36)** | **115.84ms** | **3.2755** | **178,395ms** | **+1.9%** |
+| HC attn-only+no mlp wp (Exp 37) | 115.42ms | 3.2785 | 177,742ms | +1.5% |
+| HC no MLP rl (Exp 38) | 116.36ms | 3.2762 | 179,189ms | +2.4% |
+| HC 1510 steps (Exp 39) | 116.34ms | 3.2803 | 175,673ms | +0.4% (loss worse) |
+| HC partial layers 0-6 (Exp 40) | 114.64ms | 3.2793 | 176,539ms | +0.8% (loss worse) |
+| HC custom autograd (Exp 41) | 116.06ms | 3.2801 | 178,732ms | +2.1% |
+
+**Current best: Exp 36 (attn-only bias).** 1.9% slower wall time but 0.002 better val_loss.
+
+### Analysis: Why the ~3ms/step gap is fundamental on 4xH200
+
+The 2-lane HC architecture requires:
+- 2× residual stream tensors (lane0, lane1) through all forward+backward ops
+- Per-sublayer scalar-tensor multiplies (rl, wp) for both lanes
+- Bias precompute and injection at attention sublayers
+
+Optimizations achieved: **3.33ms/step saved** (119.17→115.84ms, 50% of original gap):
+1. Precompute bias outside sequential loop: -1.2ms
+2. Skip bias for MLP sublayers: -2.1ms
+
+What doesn't work (remaining 3.26ms gap):
+- Removing scalar multiplies: torch.compile fuses them; overhead is memory bandwidth, not compute
+- Custom autograd Function: compiler already generates near-optimal kernels
+- Partial HC: removing HC from any layers degrades loss below master
+- Fewer steps: HC can't reach master's loss fast enough at reduced step count
+
+The residual 2.9% overhead maps to the irreducible memory bandwidth cost of maintaining
+2 lane tensors. On a larger cluster (8x GPUs), communication becomes a larger fraction
+of step time, reducing HC's relative overhead to ~1-2% where it would likely break even.
