@@ -1124,8 +1124,7 @@ class GPT(nn.Module):
         self.hyper_x0_bias = nn.Parameter(torch.zeros(n_sublayers, self.n_lanes, 1))
         self.hyper_x0_bias.label = 'hyper_x0_bias'
 
-        hyper_bigram_bias = torch.zeros(n_sublayers, self.n_lanes, 1)
-        hyper_bigram_bias[0::2] = 0.05  # attn sublayers only
+        hyper_bigram_bias = 0.05 * torch.ones(n_sublayers, self.n_lanes, 1)
         self.hyper_bigram_bias = nn.Parameter(hyper_bigram_bias)
         self.hyper_bigram_bias.label = 'hyper_bigram_bias'
 
@@ -1455,7 +1454,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1505  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1500  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1585,10 +1584,10 @@ class TrainingManager():
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
-            "hyper_post":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "hyper_x0_bias":       {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "hyper_bigram_bias":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "hyper_resid_lambda":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "hyper_post":          {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "hyper_x0_bias":       {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "hyper_bigram_bias":   {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "hyper_resid_lambda":  {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "lm_head":           {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
