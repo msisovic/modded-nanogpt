@@ -1176,6 +1176,11 @@ class GPT(nn.Module):
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
+        # Precompute bias terms outside sequential loop to move their backward off the critical path.
+        # Layer 0 is special: x == x0, so (resid + x0_lambda) * x + bigram * x0_bigram
+        # Layers 1+: resid * x + (x0_lambda * x0 + bigram * x0_bigram)
+        residual_bias = tuple(x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram for i in range(1, self.num_layers))
+
         # unbind gate banks to avoid select_backwards kernel
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
@@ -1207,7 +1212,7 @@ class GPT(nn.Module):
             if i == 0:
                 x = (resid_lambdas[0] + x0_lambdas[0]) * x + bigram_lambdas[0] * x0_bigram
             else:
-                x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
+                x = resid_lambdas[i] * x + residual_bias[i - 1]
 
             # Get weights for this layer from banks
             qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
