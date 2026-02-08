@@ -1459,7 +1459,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
     num_scheduled_iterations: int = 1500  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = 20  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1588,10 +1588,10 @@ class TrainingManager():
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
-            "hyper_post":          {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "hyper_x0_bias":       {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "hyper_bigram_bias":   {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "hyper_resid_lambda":  {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "hyper_post":          {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "hyper_x0_bias":       {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "hyper_bigram_bias":   {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "hyper_resid_lambda":  {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "lm_head":           {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }

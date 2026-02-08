@@ -597,3 +597,57 @@ Tiny improvement over Exp 36 (3.2755). beta2=0.95 benefit is small at full step 
 **Result (4xH200):** step_avg=**115.13ms**, val_loss=**3.2780**, train_time=174,427ms.
 **BEATS MASTER WALL TIME!** 174,427ms < 175,060ms (-633ms, -0.36%).
 val_loss only 0.0006 above master (3.2780 vs 3.2774), within +-0.003 noise.
+
+## Exp 50: beta2=0.95 + extension=10 (1510 total)
+**Config:** Same as Exp 49 but ext=10. Total 1510 steps.
+**Result (4xH200):** step_avg=**114.97ms**, val_loss=**3.2821**, train_time=173,607ms.
+Too aggressive — val_loss 0.005 above master. ext=10 not viable.
+
+## Exp 51: bigram_bias init=0.1 + ext=15 (1515 total)
+**Config:** Exp 49 + bigram_bias init 0.1 (from 0.05).
+**Hypothesis:** Higher bigram injection at init helps early convergence.
+**Result (4xH200):** step_avg=**115.10ms**, val_loss=**3.2777**, train_time=174,380ms.
+Tiny improvement over Exp 49 (3.2780→3.2777). Within noise. Beats master wall time.
+
+## Exp 52: bigram_bias init=0.15 + ext=15
+**Config:** Same as Exp 51 but bigram=0.15.
+**Result (4xH200):** step_avg=**115.17ms**, val_loss=**3.2810**, train_time=174,483ms. Overshoots.
+
+## Exp 53: bigram_bias init=0.1 + ext=20 (1520 total)
+**Config:** Exp 51 config at ext=20.
+**Result (4xH200):** step_avg=**115.55ms**, val_loss=**3.2778**, train_time=175,640ms.
+No improvement over Exp 44 (3.2750). bigram=0.1 doesn't clearly help.
+
+## Exp 54: resid_lambda lr_mul=10.0
+**Config:** Exp 44 + resid_lambda lr_mul doubled (5.0→10.0).
+**Result (4xH200):** step_avg=**115.47ms**, val_loss=**3.2886**, train_time=175,520ms.
+Way too high. Overshoots badly. **Reverted.**
+
+## Exp 55: cooldown_frac=0.50
+**Config:** Exp 44 + cooldown_frac reduced (0.55→0.50). More peak LR time.
+**Result (4xH200):** step_avg=**115.41ms**, val_loss=**3.2781**, train_time=175,422ms.
+Worse than 0.55 (3.2781 vs 3.2750).
+
+## Exp 56: cooldown_frac=0.60
+**Config:** Exp 44 + cooldown_frac increased (0.55→0.60). More cooldown time.
+**Result (4xH200):** step_avg=**115.43ms**, val_loss=**3.2781**, train_time=175,460ms.
+Same as 0.50. cooldown_frac=0.55 is already optimal.
+
+## Exp 57: x0_bias init=0.05 (nonzero init)
+**Config:** Exp 44 + x0_bias init 0.05 (from 0.0).
+**Result (4xH200):** step_avg=**115.39ms**, val_loss=**3.2809**, train_time=175,397ms.
+Hurts convergence. x0_bias init=0 is correct.
+
+---
+### Convergence Optimization Summary (Exps 42-57)
+| Config | Steps | val_loss | train_time | vs master |
+|--------|-------|----------|------------|-----------|
+| Master | 1555 | 3.2774 | 175,060ms | baseline |
+| **Exp 44 (beta2=0.95, ext=20)** | 1520 | **3.2750** | 175,295ms | loss -0.0024, time +0.13% |
+| **Exp 49 (beta2=0.95, ext=15)** | 1515 | 3.2780 | **174,427ms** | loss +0.0006, time **-0.36%** |
+| Exp 46 (beta2=0.95, sched=1470) | 1510 | 3.2788 | 175,106ms | loss +0.0014, time +0.03% |
+| Exp 48 (beta2=0.95, 1540) | 1540 | 3.2748 | 178,684ms | loss -0.0026, time +2.1% |
+
+**Best config: Exp 44** (beta2=0.95, sched=1500, ext=20, 1520 total steps).
+Beats master on val_loss (3.2750 vs 3.2774) with only 0.13% wall time overhead.
+All other tuning attempts (init, cooldown_frac, LR) were within noise or worse.
