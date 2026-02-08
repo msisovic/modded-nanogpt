@@ -584,3 +584,16 @@ Train time only 46ms over master! val_loss 0.0014 above master (within noise).
 Worse than both Exp 46 and Exp 44. Cutting scheduled steps (compressing LR schedule)
 hurts more than cutting extension steps. Exp 44 (sched=1500, ext=20) is better than
 Exp 47 (sched=1480, ext=40) at the same 1520 total steps.
+
+## Exp 48: beta2=0.95 at full 1540 steps (baseline)
+**Config:** Exp 36 + beta2=0.95 for ALL HC params. Full 1540 steps (sched=1500, ext=40).
+**Hypothesis:** Establish beta2=0.95 baseline at original step count to measure headroom.
+**Result (4xH200):** step_avg=**116.03ms**, val_loss=**3.2748**, train_time=178,684ms.
+Tiny improvement over Exp 36 (3.2755). beta2=0.95 benefit is small at full step count.
+
+## Exp 49: beta2=0.95 + extension=15 (1515 total steps)
+**Config:** Exp 48 + num_extension_iterations=15. Total 1515 steps.
+**Hypothesis:** Extension steps contribute diminishing returns; 15 should be sufficient.
+**Result (4xH200):** step_avg=**115.13ms**, val_loss=**3.2780**, train_time=174,427ms.
+**BEATS MASTER WALL TIME!** 174,427ms < 175,060ms (-633ms, -0.36%).
+val_loss only 0.0006 above master (3.2780 vs 3.2774), within +-0.003 noise.
