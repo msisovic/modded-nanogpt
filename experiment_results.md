@@ -551,3 +551,16 @@ of step time, reducing HC's relative overhead to ~1-2% where it would likely bre
 **Result (4xH200):** step_avg=**115.39ms**, val_loss=**3.2771**, train_time=175,394ms.
 val_loss BEATS master (3.2771 < 3.2774)! Train time only 334ms over master (+0.19%).
 **Nearly wall-time parity.** The last 20 extension steps contributed negligible improvement.
+
+## Exp 43: HC lr_mul=2.0 + extension=20 (1520 steps)
+**Config:** Exp 42 + lr_mul=2.0 for hyper_post, hyper_x0_bias, hyper_bigram_bias (was 1.0).
+**Hypothesis:** Higher LR for HC params → faster convergence → room to cut more steps.
+**Result (4xH200):** step_avg=**115.46ms**, val_loss=**3.2824**, train_time=175,506ms.
+val_loss above master (3.2824 > 3.2774). lr_mul=2.0 overshoots, consistent with Exp 10. **Reverted.**
+
+## Exp 44: HC beta2=0.95 + extension=20 (1520 steps)
+**Config:** Exp 42 + adam_betas=[0.9, 0.95] for ALL HC params (was [0.9, 0.99]).
+**Hypothesis:** Lower beta2 → faster second-moment adaptation → faster convergence.
+**Result (4xH200):** step_avg=**115.33ms**, val_loss=**3.2750**, train_time=175,295ms.
+val_loss beats master by 0.0024! Train time only 235ms over master (+0.13%).
+**Best yet!** beta2=0.95 helps HC convergence.
