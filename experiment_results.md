@@ -651,3 +651,53 @@ Hurts convergence. x0_bias init=0 is correct.
 **Best config: Exp 44** (beta2=0.95, sched=1500, ext=20, 1520 total steps).
 Beats master on val_loss (3.2750 vs 3.2774) with only 0.13% wall time overhead.
 All other tuning attempts (init, cooldown_frac, LR) were within noise or worse.
+
+## Exp 58: sched=1470, ext=40, cooldown=0.60
+**Config:** Exp 46 + cooldown_frac=0.60 (from 0.55). Keeps ext=40 per user preference.
+**Result (4xH200):** step_avg=**115.85ms**, val_loss=**3.2788**, train_time=174,934ms.
+**Beats master wall time!** 174,934 < 175,060 (-126ms). val_loss 0.0014 above master (within noise).
+
+## Exp 59: sched=1470, ext=40, cooldown=0.65
+**Result (4xH200):** step_avg=**116.00ms**, val_loss=**3.2801**, train_time=175,164ms. Worse. cd=0.65 too much.
+
+## Exp 60: Shorter stage 1 (1/4→1/3→5/12 stage split)
+**Config:** More time in stage 3 (batch=24) at expense of stage 1 (batch=8).
+**Result (4xH200):** step_avg=**124.31ms**, val_loss=**3.2643** (!), train_time=187,706ms.
+Amazing loss but step_avg explodes (larger batch = slower steps). Not viable for wall time.
+
+## Exp 61: sched=1460, ext=40 (1500 total), cooldown=0.60
+**Result (4xH200):** step_avg=**115.97ms**, val_loss=**3.2797**, train_time=173,961ms.
+Great time but loss deteriorating with fewer scheduled steps.
+
+## Exp 62: resid_lambda lr_mul=7.0
+**Result (4xH200):** step_avg=**116.09ms**, val_loss=**3.2825**, train_time=175,296ms. Too high, overshoots.
+
+## Exp 63: HC beta1=0.85 (from 0.9)
+**Result (4xH200):** step_avg=**115.95ms**, val_loss=**3.2789**, train_time=175,090ms. No difference.
+
+## Exp 64: Base LR=0.0085 (from 0.008)
+**Result (4xH200):** step_avg=**115.99ms**, val_loss=**3.2805**, train_time=175,142ms. Slight hurt.
+
+## Exp 65: sched=1450, ext=60 (1510 total), cooldown=0.60
+**Result (4xH200):** step_avg=**116.62ms**, val_loss=**3.2801**, train_time=176,099ms.
+More extension, fewer scheduled = worse. Compressed schedule hurts more than extra flat-LR helps.
+
+## Exp 66: sched=1465, ext=40, cooldown=0.60 (1505 total)
+**Result (4xH200):** step_avg=**116.21ms**, val_loss=**3.2792**, train_time=174,900ms.
+Beats master by 160ms. Same loss as 1470-sched configs.
+
+## Exp 67: sched=1465, ext=40, cooldown=0.55 (1505 total)
+**Result (4xH200):** step_avg=**116.17ms**, val_loss=**3.2792**, train_time=174,830ms.
+**Best ext=40 config.** Beats master by 230ms. val_loss 0.0018 above master (within noise).
+
+---
+### Best ext=40 Summary (Exps 58-67)
+| Config | Steps | val_loss | train_time | vs master |
+|--------|-------|----------|------------|-----------|
+| Master | 1555 | 3.2774 | 175,060ms | baseline |
+| Exp 58 (sched=1470, cd=0.60) | 1510 | 3.2788 | 174,934ms | -126ms |
+| **Exp 67 (sched=1465, cd=0.55)** | **1505** | **3.2792** | **174,830ms** | **-230ms** |
+| Exp 46 (sched=1470, cd=0.55) | 1510 | 3.2788 | 175,106ms | +46ms |
+
+Verification runs of sched=1470 config: 3.2788, 3.2788, 3.2792 → avg 3.2789 (robust).
+val_loss gap (0.0015-0.0018) is within single-run noise (+-0.003).
