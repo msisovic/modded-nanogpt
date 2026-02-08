@@ -399,3 +399,84 @@ All modifications to Exp 20 val_loss config have been worse. The config is at a 
 - Learned resid_lambda (per-sublayer, init sqrt(1.1))
 - All HC params: adam_betas=[0.9, 0.99], lr_mul=1.0 (except resid_lambda lr_mul=5.0)
 - Forward pass: separate lane0/lane1 tensors with explicit scalar mults (Exp 27/28)
+
+---
+
+## === 4xH200 OPTIMIZATION PHASE ===
+## Goal: Beat master wall time (175,060ms @ 1555 steps, step_avg=112.58ms)
+## HC baseline on 4xH200: 183,519ms @ 1540 steps, step_avg=119.17ms, val_loss=3.2748
+## Master on 4xH200: 175,060ms @ 1555 steps, step_avg=112.58ms, val_loss=3.2774
+
+---
+
+### Profiling: Forward/Backward/Optimizer Split (1 GPU, Stage 2, batch=24)
+
+Instrumented forward, backward, and optimizer with `torch.cuda.synchronize()` + `time.perf_counter()`.
+5-step warmup, 20-step average. Single GPU, grad_accum_steps=1.
+
+| Variant | Forward | Backward | Optimizer | Total |
+|---------|---------|----------|-----------|-------|
+| **Master** | 54.3ms | 102.2ms | 4.9ms | 161.4ms |
+| **HC original** | 55.5ms | 109.7ms | 4.9ms | 170.1ms |
+| **HC precompute** | 55.3ms | 107.7ms | 4.9ms | 167.9ms |
+| **HC detach x0+bg** | 54.9ms | 106.5ms | 4.9ms | 166.3ms |
+| **HC precompute+bg_detach** | 55.0ms | 106.0ms | 4.9ms | 165.9ms |
+
+**Key finding: Backward is 86% of HC overhead** (+7.5ms bwd vs +1.2ms fwd).
+HC adds 154 scalar gradient reductions (22 sublayers × 7 scalars) in backward.
+
+---
+
+## Exp 32: Detach x0 and x0_bigram (cut gradient flow through embeddings)
+**Config:** HC original + `x0.detach()` and `x0_bigram.detach()` at HC bias terms.
+**Hypothesis:** Embedding gradients through HC bias terms may be redundant with direct embedding gradients.
+**Result (4xH200):** step_avg=**117.31ms**, val_loss=**3.2911**. Loss degradation of +0.016.
+**Conclusion:** Embedding gradients through HC terms provide critical deep supervision signal. **Reverted.**
+
+## Exp 33: Precompute bias terms (mathematically identical)
+**Config:** HC original but precompute `hc_bias0[i] = x0 * xb0[2*i] + x0_bigram * bb0[2*i]` before
+the main loop. Separates bias gradient computation from sequential loop backward.
+**Result (4xH200):** step_avg=**117.96ms**, val_loss=**3.2734**. Clean win — identical loss, ~1.2ms faster.
+train_time=181,663ms.
+
+## Exp 34: Precompute + bigram-only detach
+**Config:** Exp 33 + `x0_bigram.detach()` in bias terms (keep x0 gradients, detach bigram only).
+**Hypothesis:** Bigram embedding gradients through HC may be less important than x0 gradients.
+**Result (4xH200):** step_avg=**117.59ms**, val_loss=**3.2886**. Loss degradation of +0.014.
+Bigram gradient flow is also critical. **Reverted.**
+
+## Exp 35: Stacked lanes tensor (2,T,D) for batched backward
+**Config:** Merge lane0/lane1 into a single (2,T,D) tensor for batched operations.
+**Result:** Backward time DOUBLED (~200ms vs ~110ms). torch.compile generates terrible
+kernels for the (2,T,D) broadcast pattern. **Completely abandoned.**
+
+## Exp 36: Attn-only bias (precompute + skip bias for MLP sublayers)
+**Config:** Exp 33 + remove x0_bias and bigram_bias from MLP sublayer updates.
+MLP becomes `lane = rl * lane + h * wp` (no bias injection).
+Attn keeps full `lane = rl * lane + h * wp + precomputed_bias`.
+**Hypothesis:** MLP sublayers may not need bias terms; removing them eliminates
+22 tensor additions + their backward gradients from the sequential loop.
+**Result (4xH200):** step_avg=**115.84ms**, val_loss=**3.2755**, train_time=178,395ms.
+**Best config: saved 3.3ms/step** vs original HC. Loss still beats master (3.2774).
+Gap to master: 178,395 - 175,060 = 3,335ms (+1.9%).
+
+## Exp 37: Attn-only bias + no MLP w_post
+**Config:** Exp 36 + remove w_post from MLP (MLP becomes `lane = rl * lane + h`).
+**Hypothesis:** Simplifying MLP update further might save more time.
+**Result (4xH200):** step_avg=**115.42ms**, val_loss=**3.2785**. 0.4ms faster but loss
+regressed above master's 3.2774. MLP w_post matters for lane differentiation. **Reverted.**
+
+---
+### 4xH200 Optimization Summary
+| Config | step_avg | val_loss | train_time | vs master |
+|--------|----------|----------|------------|-----------|
+| Master (1555 steps) | 112.58ms | 3.2774 | 175,060ms | baseline |
+| HC original (1540) | 119.17ms | 3.2748 | 183,519ms | +4.8% |
+| HC precompute (Exp 33) | 117.96ms | 3.2734 | 181,663ms | +3.8% |
+| **HC attn-only bias (Exp 36)** | **115.84ms** | **3.2755** | **178,395ms** | **+1.9%** |
+| HC attn-only+no mlp wp (Exp 37) | 115.42ms | 3.2785 | 177,742ms | +1.5% |
+| HC full detach (Exp 32) | 117.31ms | 3.2911 | 180,661ms | BROKEN |
+| HC precompute+bg detach (Exp 34) | 117.59ms | 3.2886 | 181,091ms | BROKEN |
+
+Current best: Exp 36 (attn-only bias). 1.9% slower than master but 0.002 better val_loss.
+Remaining gap: ~3.3ms/step. Backward pass scalar gradient reductions are the main bottleneck.

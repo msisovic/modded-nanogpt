@@ -1201,6 +1201,10 @@ class GPT(nn.Module):
         bb0 = (zero,) + bb0[1:]
         bb1 = (zero,) + bb1[1:]
 
+        # Precompute bias terms for attn sublayers only (MLP sublayers use rl*lane + h*wp without bias)
+        hc_bias0 = tuple(x0 * xb0[2*i] + x0_bigram * bb0[2*i] for i in range(self.num_layers))
+        hc_bias1 = tuple(x0 * xb1[2*i] + x0_bigram * bb1[2*i] for i in range(self.num_layers))
+
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
@@ -1234,14 +1238,14 @@ class GPT(nn.Module):
             si = 2 * i  # sublayer index for attn
             if block.attn is not None:
                 h = block.attn(norm(lane0), attn_args, qkvo_w)
-                lane0 = rl[si] * lane0 + h * wp0[si] + x0 * xb0[si] + x0_bigram * bb0[si]
-                lane1 = rl[si] * lane1 + h * wp1[si] + x0 * xb1[si] + x0_bigram * bb1[si]
+                lane0 = rl[si] * lane0 + h * wp0[si] + hc_bias0[i]
+                lane1 = rl[si] * lane1 + h * wp1[si] + hc_bias1[i]
             if i in skip_in:
                 skip_connections.append(lane0)
             if block.mlp is not None:
                 h = block.mlp(norm(lane1), c_fc, c_proj)
-                lane0 = rl[si+1] * lane0 + h * wp0[si+1] + x0 * xb0[si+1] + x0_bigram * bb0[si+1]
-                lane1 = rl[si+1] * lane1 + h * wp1[si+1] + x0 * xb1[si+1] + x0_bigram * bb1[si+1]
+                lane0 = rl[si+1] * lane0 + h * wp0[si+1]
+                lane1 = rl[si+1] * lane1 + h * wp1[si+1]
             if i == backout_layer:
                 x_backout = lane0
 
