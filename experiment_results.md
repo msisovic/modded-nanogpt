@@ -936,3 +936,80 @@ Goal: Shift loss down by ~0.0025 to reach target 3.278
 - Improvement from baseline: -0.0021 (3.2805 → 3.2784)
 
 **Next:** Run multiple iterations of Exp 80 config for statistical validation.
+
+---
+
+## === 2xH200 EXPERIMENTS (Exps 82+) ===
+## Baseline config: rl=1.06, wp=0.98, sched=1465, ext=40, cd=0.55 (1505 total steps)
+## Master on origin/master: sched=1515, ext=40 (1555 total steps)
+
+---
+
+### Exp 82: x0_bias lr_mul=5.0 + bigram_bias lr_mul=5.0
+**Config:** Exp 80 base + x0_bias lr_mul 1.0→5.0, bigram_bias lr_mul 1.0→5.0 (match master's lambda LR)
+**Hypothesis:** Master uses lr_mul=5.0 for x0_lambdas/bigram_lambdas. HC uses 1.0. Maybe higher LR helps.
+**Result (2xH200):** val_loss=**3.2801** @ 1505 steps. WORSE. Consistent with Exps 10, 21, 45. **Reverted.**
+
+### Exp 83: rl=1.05, wp=0.95 (round numbers)
+**Config:** resid_lambda init=1.05, w_post init=0.95
+**Result (2xH200):** val_loss=**3.2783** @ 1505 steps. Essentially tied with Exp 80 (3.2784). Not clearly better.
+
+### Exp 84: rl=1.10, wp=0.95
+**Config:** resid_lambda init=1.10, w_post init=0.95
+**Result (2xH200):** val_loss=**3.2807** @ 1505 steps. WORSE. rl=1.10 too high, consistent with Exp 79.
+
+### Exp 85: rl=1.05, wp=0.98
+**Config:** resid_lambda init=1.05, w_post init=0.98
+**Result (2xH200):** val_loss=**3.2800** @ 1505 steps. WORSE than Exp 80. rl=1.06 is better than 1.05.
+
+### Exp 86: rl=1.10, wp=0.98
+**Config:** resid_lambda init=1.10, w_post init=0.98
+**Result (2xH200):** val_loss=**3.2806** @ 1505 steps. WORSE. Confirms rl=1.10 is too high.
+
+### Exp 87: rl=1.07, wp=0.97
+**Config:** resid_lambda init=1.07, w_post init=0.97
+**Result (2xH200):** val_loss=**3.2807** @ 1505 steps. WORSE. rl=1.06 + wp=0.98 is the sweet spot.
+
+### Exp 88: rl=1.06, wp=0.95
+**Config:** resid_lambda init=1.06, w_post init=0.95
+**Result (2xH200):** val_loss=**3.2802** @ 1505 steps. WORSE. wp=0.98 is optimal.
+
+---
+
+### Init Sweep Summary (2xH200, 1505 steps)
+| Exp | rl | wp | Other | val_loss |
+|-----|------|------|-------|----------|
+| **80** | **1.06** | **0.98** | **baseline** | **3.2784** |
+| 82 | 1.06 | 0.98 | lr_mul=5.0 biases | 3.2801 |
+| 83 | 1.05 | 0.95 | | 3.2783 |
+| 84 | 1.10 | 0.95 | | 3.2807 |
+| 85 | 1.05 | 0.98 | | 3.2800 |
+| 86 | 1.10 | 0.98 | | 3.2806 |
+| 87 | 1.07 | 0.97 | | 3.2807 |
+| 88 | 1.06 | 0.95 | | 3.2802 |
+
+**Conclusions:**
+- rl=1.10 consistently worse (~3.2807). rl≥1.08 overshoots.
+- wp=0.95 not clearly better than wp=0.98 (3.2783 vs 3.2784 within noise).
+- lr_mul=5.0 for x0_bias/bigram_bias still hurts (consistent across all experiments).
+- **rl=1.06, wp=0.98 remains optimal.**
+
+---
+
+### 7-Run Validation: rl=1.06, wp=0.98 @ 1505 steps (2xH200)
+| Run | val_loss |
+|-----|----------|
+| 1 | 3.2800 |
+| 2 | 3.2809 |
+| 3 | 3.2824 |
+| 4 | 3.2810 |
+| 5 | 3.2812 |
+| 6 | 3.2796 |
+| 7 | 3.2809 |
+| **Mean** | **3.2809** |
+| **Std** | **±0.0009** |
+
+**Statistics:**
+- Mean: 3.2809, Target: 3.278, **Gap: +0.0029**
+- Does NOT pass p < 0.01 for mean ≤ 3.278 at 1505 steps
+- Need either more steps or further loss improvement to reach target
