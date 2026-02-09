@@ -813,3 +813,15 @@ Full HC config with adam_betas=[0.9, 0.95] for all HC params.
 | **Avg** | **3.2766** |
 
 4/5 runs under 3.277. Run 2 barely missed at 3.2776. Need a small margin improvement.
+
+---
+
+## Post 5-Run Testing: Convergence Tuning (Exp 73+)
+## Goal: Beat master wall time (175,060ms @ 1555 steps) with val_loss ≤ 3.278 (p < 0.01)
+
+## Exp 73: sched=1475, ext=40 (1515 total steps)
+**Config:** Full HC config with beta2=0.95, attn-only bias precompute (Exp 67 base).
+num_scheduled_iterations=1475, num_extension_iterations=40.
+**Result (4xH200):** step_avg=**116.60ms**, val_loss=**3.2799**, train_time=176,649ms.
+**Analysis:** Too slow (+1,589ms vs master, +0.91%). Loss also above target (3.2799 > 3.278).
+Need fewer steps to save time.
