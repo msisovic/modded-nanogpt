@@ -825,3 +825,18 @@ num_scheduled_iterations=1475, num_extension_iterations=40.
 **Result (4xH200):** step_avg=**116.60ms**, val_loss=**3.2799**, train_time=176,649ms.
 **Analysis:** Too slow (+1,589ms vs master, +0.91%). Loss also above target (3.2799 > 3.278).
 Need fewer steps to save time.
+
+## Exp 74: sched=1480, ext=40 (1520 total steps)
+**Config:** Same as Exp 73, num_scheduled_iterations=1480.
+**Result (4xH200):** step_avg=**116.27ms**, val_loss=**3.2788**, train_time=176,735ms.
+**Analysis:** Even slower (+1,675ms vs master, +0.96%). Loss improved slightly (3.2788 vs 3.2799)
+but still above target. Both Exp 73 and 74 are slower than Exp 67 (sched=1465, 174,830ms).
+
+**Trend Analysis (sched, total steps, train_time, val_loss):**
+- Exp 67: 1465, 1505, 174,830ms, 3.2792 ← BEST (beats master by 230ms)
+- Exp 73: 1475, 1515, 176,649ms, 3.2799
+- Exp 74: 1480, 1520, 176,735ms, 3.2788
+
+**Conclusion:** Increasing scheduled steps beyond 1465 hurts wall time more than it helps convergence.
+The step_avg is roughly constant (~116ms), so more steps = worse wall time.
+**Next:** Try 1470 with multiple runs for statistics, or explore other convergence improvements.
