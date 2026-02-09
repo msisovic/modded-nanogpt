@@ -1128,7 +1128,7 @@ class GPT(nn.Module):
         self.hyper_bigram_bias = nn.Parameter(hyper_bigram_bias)
         self.hyper_bigram_bias.label = 'hyper_bigram_bias'
 
-        self.hyper_resid_lambda = nn.Parameter(math.sqrt(1.1) * torch.ones(n_sublayers))
+        self.hyper_resid_lambda = nn.Parameter(1.02 * torch.ones(n_sublayers))
         self.hyper_resid_lambda.label = 'hyper_resid_lambda'
 
         pad = (-num_layers * 2 - 3) % dist.get_world_size()  # updated: 2*num_layers (SA lambdas only)
@@ -1458,7 +1458,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1500  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1465  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"

@@ -888,4 +888,12 @@ Goal: Verify mean val_loss ≤ 3.278 with p < 0.01
 - Original Exp 67: val_loss=3.2792 (single run outlier)
 - Mean of 5 runs: 3.2805 (true performance)
 
-**Next:** Tune HC initialization parameters to shift loss down by ~0.0025
+---
+
+## HC Initialization Tuning (Exps 77+)
+Goal: Shift loss down by ~0.0025 to reach target 3.278
+
+### Exp 77: resid_lambda init = 1.02 (vs sqrt(1.1)≈1.0488)
+**Config:** Exp 67 base (sched=1465, cd=0.55) + resid_lambda init lowered to 1.02
+**Result:** val_loss=**3.2840**, train_time=175,152ms
+**Analysis:** WORSE (+0.0035 vs baseline mean 3.2805). Lower init hurts. Try higher.
