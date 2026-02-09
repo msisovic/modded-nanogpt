@@ -1013,3 +1013,37 @@ Goal: Shift loss down by ~0.0025 to reach target 3.278
 - Mean: 3.2809, Target: 3.278, **Gap: +0.0029**
 - Does NOT pass p < 0.01 for mean ≤ 3.278 at 1505 steps
 - Need either more steps or further loss improvement to reach target
+
+---
+
+## === STEP COUNT SEARCH: wp=1.0, rl=sqrt(1.1) (Exps 89+) ===
+## Reverted init to wp=1.0, rl=sqrt(1.1)≈1.0488 (pre-Exp 77 config)
+## Goal: Find minimum sched that achieves mean val_loss ≤ 3.278 with p < 0.01
+## Master baseline: sched=1515, ext=40 (1555 total)
+
+---
+
+### Exp 89: sched=1515 (1555 total) — master step count
+**Config:** wp=1.0, rl=sqrt(1.1), sched=1515, ext=40, cd=0.55
+**Result (2xH200, 2 runs before stopped):** 3.2737, 3.2746. Both well under 3.278. Overkill.
+
+### Exp 90: sched=1470 (1510 total)
+**Config:** wp=1.0, rl=sqrt(1.1), sched=1470, ext=40, cd=0.55
+**Result (2xH200, 5 runs before stopped):** 3.2791, 3.2794, 3.2813, 3.2777, 3.2790
+**Mean (5 runs): 3.2793** — too high, does not pass.
+
+### Exp 91: sched=1475 (1515 total)
+**Config:** wp=1.0, rl=sqrt(1.1), sched=1475, ext=40, cd=0.55
+**Result (2xH200, 6 runs):**
+| Run | val_loss |
+|-----|----------|
+| 1 | 3.2775 |
+| 2 | 3.2776 |
+| 3 | 3.2800 |
+| 4 | 3.2780 |
+| 5 | 3.2778 |
+| 6 | 3.2781 |
+| **Mean** | **3.2782** |
+| **Std** | **±0.0009** |
+**Analysis:** Mean 3.2782, gap +0.0002. Borderline — one outlier (3.2800) pulls mean up.
+Likely does NOT pass p < 0.01. Need slightly more steps.
