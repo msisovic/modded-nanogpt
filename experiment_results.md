@@ -839,4 +839,15 @@ but still above target. Both Exp 73 and 74 are slower than Exp 67 (sched=1465, 1
 
 **Conclusion:** Increasing scheduled steps beyond 1465 hurts wall time more than it helps convergence.
 The step_avg is roughly constant (~116ms), so more steps = worse wall time.
-**Next:** Try 1470 with multiple runs for statistics, or explore other convergence improvements.
+
+## Exp 75: sched=1460, ext=40, cooldown=0.55 (1500 total steps)
+**Config:** Testing if cd=0.55 improves upon Exp 61's cd=0.60 at sched=1460.
+**Result (4xH200):** step_avg=**116.47ms**, val_loss=**3.2802**, train_time=174,712ms.
+**Analysis:** WORSE than Exp 61 (cd=0.60) on both metrics:
+- Exp 61 (cd=0.60): 173,961ms, val_loss=3.2797
+- Exp 75 (cd=0.55): 174,712ms, val_loss=3.2802 (+751ms, +0.0005 loss)
+
+**Finding:** At very low step counts (1460), higher cooldown_frac (0.60) helps more than 0.55.
+But still worse than Exp 67 (sched=1465, cd=0.55): 174,830ms, val_loss=3.2792.
+
+**Next:** Exp 67 remains the best. Should run multiple iterations for statistical validation (p < 0.01).
