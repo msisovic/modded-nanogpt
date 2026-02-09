@@ -1118,7 +1118,7 @@ class GPT(nn.Module):
         self.n_lanes = 2
         n_sublayers = 2 * num_layers
 
-        self.hyper_w_post = nn.Parameter(0.98 * torch.ones(n_sublayers, self.n_lanes, 1))
+        self.hyper_w_post = nn.Parameter(0.96 * torch.ones(n_sublayers, self.n_lanes, 1))
         self.hyper_w_post.label = 'hyper_post'
 
         self.hyper_x0_bias = nn.Parameter(torch.zeros(n_sublayers, self.n_lanes, 1))

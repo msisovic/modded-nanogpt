@@ -919,3 +919,20 @@ Goal: Shift loss down by ~0.0025 to reach target 3.278
 **Result:** val_loss=**3.2784**, train_time=175,079ms
 **Analysis:** ✓✓ EVEN BETTER! (-0.0021 vs baseline 3.2805, -0.0011 vs rl=1.06 alone)
 **Gap to target:** 3.2784 vs 3.278 = +0.0004 (very close!)
+
+### Exp 81: resid_lambda=1.06 + w_post init = 0.96
+**Config:** Exp 67 base + resid_lambda=1.06 + w_post=0.96
+**Result:** val_loss=**3.2810**, train_time=175,546ms
+**Analysis:** WORSE (+0.0026 vs wp=0.98). Too low. **w_post=0.98 is optimal.**
+
+---
+
+## Summary of Initialization Tuning:
+**Best Configuration (Exp 80):**
+- resid_lambda init: 1.06 (vs sqrt(1.1)≈1.0488)
+- w_post init: 0.98 (vs 1.0)
+- **Result: val_loss=3.2784** (single run)
+- **Gap to target: +0.0004** (essentially at target!)
+- Improvement from baseline: -0.0021 (3.2805 → 3.2784)
+
+**Next:** Run multiple iterations of Exp 80 config for statistical validation.
