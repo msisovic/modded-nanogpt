@@ -861,4 +861,15 @@ But still worse than Exp 67 (sched=1465, cd=0.55): 174,830ms, val_loss=3.2792.
 **Finding:** At sched=1465, cd=0.55 is optimal. Lower cooldown (0.50) hurts both time and loss.
 
 **Conclusion:** Exp 67 (sched=1465, cd=0.55) is the optimal configuration after exhaustive search.
-**Next:** Run multiple iterations of Exp 67 for statistical validation (p < 0.01).
+
+---
+
+## Exp 67 Multi-Run Validation (sched=1465, cd=0.55, 1505 total steps)
+Goal: Verify mean val_loss ≤ 3.278 with p < 0.01
+
+| Run | val_loss | train_time | step_avg |
+|-----|----------|------------|----------|
+| 1 | 3.2798 | 175,096ms | 116.34ms |
+| **Mean (1)** | **3.2798** | **175,096ms** | - |
+
+Original Exp 67: val_loss=3.2792, train_time=174,830ms
