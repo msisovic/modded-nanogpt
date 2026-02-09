@@ -913,3 +913,9 @@ Goal: Shift loss down by ~0.0025 to reach target 3.278
 - sqrt(1.1)≈1.0488: 3.2805 (baseline)
 - **1.06: 3.2795** ✓ **BEST**
 - 1.08: 3.2821 ❌
+
+### Exp 80: resid_lambda=1.06 + w_post init = 0.98 (vs 1.0)
+**Config:** Exp 67 base + resid_lambda init=1.06 + w_post init=0.98
+**Result:** val_loss=**3.2784**, train_time=175,079ms
+**Analysis:** ✓✓ EVEN BETTER! (-0.0021 vs baseline 3.2805, -0.0011 vs rl=1.06 alone)
+**Gap to target:** 3.2784 vs 3.278 = +0.0004 (very close!)

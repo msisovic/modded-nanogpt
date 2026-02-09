@@ -1118,7 +1118,7 @@ class GPT(nn.Module):
         self.n_lanes = 2
         n_sublayers = 2 * num_layers
 
-        self.hyper_w_post = nn.Parameter(torch.ones(n_sublayers, self.n_lanes, 1))
+        self.hyper_w_post = nn.Parameter(0.98 * torch.ones(n_sublayers, self.n_lanes, 1))
         self.hyper_w_post.label = 'hyper_post'
 
         self.hyper_x0_bias = nn.Parameter(torch.zeros(n_sublayers, self.n_lanes, 1))
@@ -1128,7 +1128,7 @@ class GPT(nn.Module):
         self.hyper_bigram_bias = nn.Parameter(hyper_bigram_bias)
         self.hyper_bigram_bias.label = 'hyper_bigram_bias'
 
-        self.hyper_resid_lambda = nn.Parameter(1.08 * torch.ones(n_sublayers))
+        self.hyper_resid_lambda = nn.Parameter(1.06 * torch.ones(n_sublayers))
         self.hyper_resid_lambda.label = 'hyper_resid_lambda'
 
         pad = (-num_layers * 2 - 3) % dist.get_world_size()  # updated: 2*num_layers (SA lambdas only)
