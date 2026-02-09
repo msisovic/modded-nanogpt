@@ -897,3 +897,8 @@ Goal: Shift loss down by ~0.0025 to reach target 3.278
 **Config:** Exp 67 base (sched=1465, cd=0.55) + resid_lambda init lowered to 1.02
 **Result:** val_loss=**3.2840**, train_time=175,152ms
 **Analysis:** WORSE (+0.0035 vs baseline mean 3.2805). Lower init hurts. Try higher.
+
+### Exp 78: resid_lambda init = 1.06 (vs sqrt(1.1)≈1.0488)
+**Config:** Exp 67 base + resid_lambda init increased to 1.06
+**Result:** val_loss=**3.2795**, train_time=175,203ms
+**Analysis:** ✓ BETTER! (-0.001 vs baseline 3.2805). Higher init helps. Try even higher.
