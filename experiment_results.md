@@ -873,6 +873,19 @@ Goal: Verify mean val_loss ≤ 3.278 with p < 0.01
 | 2 | 3.2815 | 175,245ms | 116.44ms |
 | 3 | 3.2800 | 175,105ms | 116.35ms |
 | 4 | 3.2811 | 175,232ms | 116.43ms |
-| **Mean (4)** | **3.2806** | **175,170ms** | - |
+| 5 | 3.2801 | 175,212ms | 116.42ms |
+| **Mean (5)** | **3.2805** | **175,178ms** | **116.39ms** |
+| **Std Dev** | **±0.0008** | **±67ms** | - |
 
-Original Exp 67: val_loss=3.2792, train_time=174,830ms
+**Statistics:**
+- Mean: 3.2805, Target: 3.278, **Gap: +0.0025** (0.076% above target)
+- Std Dev: 0.0008 (very consistent - systematic, not random)
+- Train time: 175,178ms vs master 175,060ms (+118ms, +0.07%)
+
+**Conclusion:**
+✅ Wall time parity achieved (+0.07% overhead)
+❌ Loss **consistently 0.0025 above target** - need HC initialization tuning
+- Original Exp 67: val_loss=3.2792 (single run outlier)
+- Mean of 5 runs: 3.2805 (true performance)
+
+**Next:** Tune HC initialization parameters to shift loss down by ~0.0025
