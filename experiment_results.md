@@ -870,6 +870,7 @@ Goal: Verify mean val_loss ≤ 3.278 with p < 0.01
 | Run | val_loss | train_time | step_avg |
 |-----|----------|------------|----------|
 | 1 | 3.2798 | 175,096ms | 116.34ms |
-| **Mean (1)** | **3.2798** | **175,096ms** | - |
+| 2 | 3.2815 | 175,245ms | 116.44ms |
+| **Mean (2)** | **3.2807** | **175,171ms** | - |
 
 Original Exp 67: val_loss=3.2792, train_time=174,830ms
