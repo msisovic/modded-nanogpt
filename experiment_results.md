@@ -850,4 +850,15 @@ The step_avg is roughly constant (~116ms), so more steps = worse wall time.
 **Finding:** At very low step counts (1460), higher cooldown_frac (0.60) helps more than 0.55.
 But still worse than Exp 67 (sched=1465, cd=0.55): 174,830ms, val_loss=3.2792.
 
-**Next:** Exp 67 remains the best. Should run multiple iterations for statistical validation (p < 0.01).
+## Exp 76: sched=1465, ext=40, cooldown=0.50 (1505 total steps)
+**Config:** Testing if cd=0.50 improves upon Exp 67's cd=0.55 at sched=1465.
+**Result (4xH200):** step_avg=**116.50ms**, val_loss=**3.2798**, train_time=175,338ms.
+**Analysis:** WORSE than both cd=0.55 and cd=0.60:
+- Exp 67 (cd=0.55): 174,830ms, val_loss=3.2792 ✓ BEST
+- Exp 66 (cd=0.60): 174,900ms, val_loss=3.2792
+- Exp 76 (cd=0.50): 175,338ms, val_loss=3.2798 (+508ms, +0.0006 loss)
+
+**Finding:** At sched=1465, cd=0.55 is optimal. Lower cooldown (0.50) hurts both time and loss.
+
+**Conclusion:** Exp 67 (sched=1465, cd=0.55) is the optimal configuration after exhaustive search.
+**Next:** Run multiple iterations of Exp 67 for statistical validation (p < 0.01).
