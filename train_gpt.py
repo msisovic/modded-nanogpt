@@ -1233,24 +1233,17 @@ class GPT(nn.Module):
                 lane0 = lane0 + skip_gate_out * skip_val
                 lane1 = lane1 + skip_gate_out * skip_val
 
-            # Exp 102: Single-stream layers 4-6 only
-            single_stream = (4, 5, 6)
-
             if block.attn is not None:
                 h = block.attn(norm(lane0), attn_args, qkvo_w)
                 h = h + hc_bias[i]  # bias-on-h: single bias distributed to lanes via wp
                 lane0 = rl[si] * lane0 + h * wp0[si]
-                if i not in single_stream:
-                    lane1 = rl[si] * lane1 + h * wp1[si]
+                lane1 = rl[si] * lane1 + h * wp1[si]
             if i in skip_in:
                 skip_connections.append(lane0)
             if block.mlp is not None:
-                # In single-stream layers, MLP reads lane0 (fresh) instead of lane1 (stale)
-                mlp_in = lane0 if i in single_stream else lane1
-                h = block.mlp(norm(mlp_in), c_fc, c_proj)
+                h = block.mlp(norm(lane1), c_fc, c_proj)
                 lane0 = rl[si+1] * lane0 + h * wp0[si+1]
-                if i not in single_stream:
-                    lane1 = rl[si+1] * lane1 + h * wp1[si+1]
+                lane1 = rl[si+1] * lane1 + h * wp1[si+1]
             if i == backout_layer:
                 x_backout = lane0
 

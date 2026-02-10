@@ -1311,5 +1311,33 @@ Layer 7 has |diff|=0.50 — it needs HC. Too aggressive.
 | 102 | 4-6 single | 327,940ms | -1,803ms | 3.2861 | +0.008 |
 | 101 | 4-7 single | 327,852ms | -1,891ms | 3.2936 | +0.016 |
 
-**Best tradeoff: Exp 102** (layers 4-6): -1.8s for +0.008 loss.
-At ~217ms/step, 1.8s buys ~8 extra steps to compensate.
+### Exp 103: MLP-only single-stream layers 4-7 (attn stays dual)
+**Config:** Attn always dual-lane, MLP reads lane0 + writes lane0 only at layers 4-7.
+**Result:** val_loss=**3.2878** (+0.010), train_time=**329,121ms** (-622ms)
+Keeping attn dual costs time without helping loss enough.
+
+### Exp 104: Single-stream layers 5-6 only
+**Config:** Narrower range (just 2 layers).
+**Result:** val_loss=**3.2850** (+0.007), train_time=**329,798ms** (-55ms only)
+Too few layers — negligible time savings.
+
+### Exp 105: Exp 102 + ext=48 (1523 total steps)
+**Config:** Layers 4-6 single-stream + 8 extra extension steps to compensate for loss.
+**Result:** val_loss=**3.2868** (+0.009), train_time=**330,820ms** (+1,077ms!)
+Extra steps cost more time than we saved. Loss still not recovered.
+
+### Selective HC Conclusion
+| Exp | Config | train_time | Δtime | val_loss | Δloss |
+|-----|--------|------------|-------|----------|-------|
+| baseline | full HC | 329,743ms | — | 3.2777 | — |
+| 100 | L4-5 single | 328,489ms | -1,254ms | 3.2850 | +0.007 |
+| **102** | **L4-6 single** | **327,940ms** | **-1,803ms** | **3.2861** | **+0.008** |
+| 101 | L4-7 single | 327,852ms | -1,891ms | 3.2936 | +0.016 |
+| 103 | L4-7 MLP-only | 329,121ms | -622ms | 3.2878 | +0.010 |
+| 104 | L5-6 single | 329,798ms | -55ms | 3.2850 | +0.007 |
+| 105 | L4-6 + ext=48 | 330,820ms | +1,077ms | 3.2868 | +0.009 |
+
+**Verdict:** Single-stream middle layers save ~1.8s wall time but cost ~0.008 loss.
+Extra steps can't compensate — the loss degradation per removed lane op is too steep.
+The 2-lane architecture is load-bearing at every layer. Even low-differentiation layers
+(|wp0-wp1|=0.02) contribute meaningful gradient paths that aid convergence.
