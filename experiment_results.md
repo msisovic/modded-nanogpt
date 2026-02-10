@@ -1486,10 +1486,15 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 | 109 | 1.0 | 1.0 | 1.0 | 1.0 | **3.2794** | 1515 |
 | **110** | **1.0** | **2.0** | **0.5** | **0.5** | **3.2796** | **1510** |
 | 111 | 1.0 | 2.0 | 0.5 | 0.25 | 3.2814 | 1510 |
-| 112 | 0.75 | 2.5 | 0.5 | 0.5 | *running* | 1510 |
+| 112 | 0.75 | 2.5 | 0.5 | 0.5 | 3.2830 | 1510 |
+| 113 | 0.75 | 3.0 | 0.5 | 0.5 | 3.2815 | 1510 |
+| 114 | 0.5 | 3.0 | 0.5 | 0.5 | 3.2817 | 1510 |
+| 115 | 1.0 | 3.0 | 0.5 | 0.5 | *running* | 1510 |
 
 **Key findings:**
 1. **Attn wp1 → 2.0 init helped** (allowed 5-step reduction while maintaining loss)
 2. **MLP wp0 → 0.5 init helped** (matches universal learned pattern across all layers)
 3. **MLP wp1 → 0.25 HURT** despite matching learned values — optimizer trajectory matters
 4. Attn weights benefit from higher init (upward learning trend), MLP from moderate init (downward trend)
+5. **wp1=3.0 with wp0=0.75 or 0.5**: 3.2815/3.2817 — marginal improvement over 112 (3.2830), run variance likely
+6. **Exp 114: wp0=0.5 caused L7 attn wp0 to go negative (-0.41)** — too low init destabilizes early HC layers
