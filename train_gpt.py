@@ -1228,13 +1228,12 @@ class GPT(nn.Module):
             si = 2 * i  # sublayer index for attn
 
             if i in skip_out:
-                # Exp 92: Route skip through HC like a sublayer output
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
-                h = skip_gate_out * skip_connections.pop()
-                h = h + hc_bias[i]
-                lane0 = rl[si] * lane0 + h * wp0[si]
-                lane1 = rl[si] * lane1 + h * wp1[si]
-            elif block.attn is not None:
+                skip_val = skip_connections.pop()
+                lane0 = lane0 + skip_gate_out * skip_val
+                lane1 = lane1 + skip_gate_out * skip_val
+
+            if block.attn is not None:
                 h = block.attn(norm(lane0), attn_args, qkvo_w)
                 h = h + hc_bias[i]  # bias-on-h: single bias distributed to lanes via wp
                 lane0 = rl[si] * lane0 + h * wp0[si]
