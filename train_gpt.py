@@ -1224,15 +1224,17 @@ class GPT(nn.Module):
             c_fc = mlp_fcs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
             c_proj = mlp_projs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
 
-            if i in skip_out:
-                skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
-                skip_val = skip_connections.pop()
-                lane0 = lane0 + skip_gate_out * skip_val
-                lane1 = lane1 + skip_gate_out * skip_val
-
             block = self.blocks[i]
             si = 2 * i  # sublayer index for attn
-            if block.attn is not None:
+
+            if i in skip_out:
+                # Exp 92: Route skip through HC like a sublayer output
+                skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
+                h = skip_gate_out * skip_connections.pop()
+                h = h + hc_bias[i]
+                lane0 = rl[si] * lane0 + h * wp0[si]
+                lane1 = rl[si] * lane1 + h * wp1[si]
+            elif block.attn is not None:
                 h = block.attn(norm(lane0), attn_args, qkvo_w)
                 h = h + hc_bias[i]  # bias-on-h: single bias distributed to lanes via wp
                 lane0 = rl[si] * lane0 + h * wp0[si]
@@ -1867,30 +1869,21 @@ if master_process:
         cumulative_gain = resid_lambda.prod().item()
         print0(f"[resid_lambda] Cumulative gain: {cumulative_gain:.4f}", console=True)
 
-        # We will look at Early, Middle, and Late sublayers
-        indices_to_check = [2, n_sublayers // 2, n_sublayers - 2]
-        labels = ["EARLY (Attn Layer 1)", "MIDDLE (Attn Layer ~6)", "LATE (Attn Layer ~10)"]
+        torch.set_printoptions(precision=4, sci_mode=False, linewidth=160)
 
-        torch.set_printoptions(precision=3, sci_mode=False, linewidth=160)
-
-        for idx, label in zip(indices_to_check, labels):
-            print0(f"\n--- {label} (Sublayer Index {idx}) ---", console=True)
-
-            # H_pre is frozen round-robin: even→lane0, odd→lane1
-            pre_str = "[1, 0]" if idx % 2 == 0 else "[0, 1]"
-            print0(f"  [H_pre] Lane Reads: {pre_str} (frozen round-robin)", console=True)
-
-            post_weights = w_post[idx].squeeze()
-            print0(f"  [H_post] Write Strength: {post_weights.numpy()}", console=True)
-
-            x0_b = x0_bias[idx].item()
-            xb_b = bigram_bias[idx].item()
-            print0(f"  [x0_bias] Injection (shared, bias-on-h): {x0_b:.4f}", console=True)
-            print0(f"  [bigram_bias] Injection (shared, bias-on-h): {xb_b:.4f}", console=True)
-            print0(f"  [resid_lambda] Gain: {resid_lambda[idx].item():.4f}", console=True)
-
-            # H_res is frozen identity
-            print0(f"  [H_res] Mixing Matrix: identity (frozen)", console=True)
+        # Full per-layer summary: rl, wp0, wp1, |wp0-wp1|, bias
+        print0(f"\n{'Layer':>5} {'Type':>4} {'si':>3} {'rl':>7} {'wp0':>7} {'wp1':>7} {'|diff|':>7} {'x0_b':>7} {'bb':>7}", console=True)
+        print0("-" * 65, console=True)
+        for layer in range(n_sublayers // 2):
+            for sub, stype in [(0, 'attn'), (1, 'mlp')]:
+                si = 2 * layer + sub
+                rl_val = resid_lambda[si].item()
+                wp0_val = w_post[si, 0, 0].item()
+                wp1_val = w_post[si, 1, 0].item()
+                diff = abs(wp0_val - wp1_val)
+                xb_val = x0_bias[si].item()
+                bb_val = bigram_bias[si].item()
+                print0(f"{layer:>5} {stype:>4} {si:>3} {rl_val:>7.4f} {wp0_val:>7.4f} {wp1_val:>7.4f} {diff:>7.4f} {xb_val:>7.4f} {bb_val:>7.4f}", console=True)
 
     print0("="*80 + "\n", console=True)
 

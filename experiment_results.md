@@ -1180,3 +1180,64 @@ regressed (+0.0014 vs full HC). The per-sublayer granularity may matter for qual
 **Conclusion:** These scalar-level optimizations yield diminishing returns (0.1-0.15ms).
 The bulk of the overhead is fundamental: lane1 memory bandwidth (0.71ms) and the per-lane
 `h * wp` multiplications + their backward gradients.
+
+---
+
+## === BIAS-ON-H + SKIP/BACKOUT EXPERIMENTS ===
+
+### Bias-on-h implementation (permanent change)
+Replaced per-lane x0_bias and bigram_bias `(n_sublayers, 2, 1)` with shared scalars `(n_sublayers,)`.
+Single `hc_bias` added to `h` before wp multiply, distributed to lanes via `h * wp0` / `h * wp1`.
+Previously measured at -0.11ms on 8xH100 with val_loss=3.2781 (beats master 3.2807).
+
+### Backout removal test
+Removed `x = x - backout_lambda * x_backout` and backout capture.
+**Result:** Hurt val_loss slightly. **Reverted.**
+
+### Full wp0/wp1 Analysis (learned weights, 2xH200)
+```
+Layer Type  si      rl     wp0     wp1  |diff|    x0_b      bb
+-----------------------------------------------------------------
+    0 attn   0  3.8514  1.4748  0.9514  0.5234  0.9592  0.0250
+    0  mlp   1  4.9150  0.3074  0.1362  0.1711  0.0000  0.0500
+    1 attn   2  0.6331  1.2106  1.3695  0.1589  0.7594  0.9640
+    1  mlp   3  1.3601  0.6769  0.3691  0.3078  0.0000  0.0500
+    2 attn   4  0.5172  1.5952  1.2749  0.3203  1.8705 -0.6549
+    2  mlp   5  1.3252  0.4317  0.6774  0.2458  0.0000  0.0500
+    3 attn   6  0.6356  0.6693  1.6723  1.0030  0.1970  0.5832
+    3  mlp   7  0.9629  0.9285  0.6688  0.2597  0.0000  0.0500
+    4 attn   8  0.4809  1.3223  1.3018  0.0205  1.2467  0.5896
+    4  mlp   9  1.0102  0.9135  0.6806  0.2329  0.0000  0.0500
+    5 attn  10  0.4667  1.2983  1.3155  0.0172  1.4795 -0.1873
+    5  mlp  11  1.0595  0.5166  0.7446  0.2280  0.0000  0.0500
+    6 attn  12  1.0488  1.0000  1.0000  0.0000  0.0000  0.0500
+    6  mlp  13  0.9714  0.7552  0.8783  0.1232  0.0000  0.0500
+    7 attn  14  0.5931  1.0198  1.5213  0.5015  0.7137  0.3025
+    7  mlp  15  0.9608  0.5852  0.6740  0.0887  0.0000  0.0500
+    8 attn  16  0.8994  0.6081  1.9730  1.3649 -0.0486 -0.1113
+    8  mlp  17  1.0292  0.1367  0.6113  0.4746  0.0000  0.0500
+    9 attn  18  0.8100  0.8111  1.8982  1.0871 -0.1497 -0.1259
+    9  mlp  19  0.8962  0.0319  0.6349  0.6030  0.0000  0.0500
+   10 attn  20  0.6604  1.3733  2.2150  0.8417 -0.8692  0.4248
+   10  mlp  21  1.4194  0.4339  0.4339  0.0000  0.0000  0.0500
+```
+
+**Key patterns:**
+- HC barely differentiates at layers 4-5 attn (|diff|=0.02), layer 6 (|diff|=0.00), layer 7/10 mlp (<0.09)
+- HC differentiates heavily at layers 3,8,9,10 attn (|diff| > 0.84) — late attn routes heavily to lane1
+- Layer 6 attn wp stuck at init (1.0, 1.0) — skip bypasses HC entirely
+
+**Skip connection finding:** Skip currently bypasses HC lane machinery completely.
+Injects `skip_gate_out * skip_val` directly into both lanes without going through wp/rl.
+Layer 6 HC params are dead (stuck at init). Routing skip through HC could improve quality.
+
+---
+
+## Exp 92+: Skip Connection Experiments (2xH200)
+### Baseline (bias-on-h, sched=1475, ext=40, 1515 total): val_loss=3.2777
+
+### Exp 92: Route skip through HC (wp/rl)
+**Config:** Treat skip output as sublayer h, route through `rl[si] * lane + h * wp[si]` + bias.
+Layer 6 attn wp values now actually train instead of being stuck at init.
+**Result:** val_loss=**3.2775**. Essentially identical to baseline. Layer 6 wp will now learn.
+**Decision:** Keep — cleaner integration, no loss penalty.
