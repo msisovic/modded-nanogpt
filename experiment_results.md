@@ -1241,3 +1241,23 @@ Layer 6 HC params are dead (stuck at init). Routing skip through HC could improv
 Layer 6 attn wp values now actually train instead of being stuck at init.
 **Result:** val_loss=**3.2775**. Essentially identical to baseline. Layer 6 wp will now learn.
 **Decision:** Keep — cleaner integration, no loss penalty.
+
+### Exp 93: Skip injects to lane1 only (MLP stream)
+**Config:** Exp 92 but skip only updates lane1 (`lane0 = rl * lane0` with no h addition).
+**Hypothesis:** Skip replaces attn at layer 6; MLP reads lane1, so skip should target lane1.
+**Result:** val_loss=**3.2808**. Worse by 0.003. Skip needs to reach both lanes. **Reverted.**
+
+### Exp 94: Skip as MLP input only (not persisted to lanes)
+**Config:** Skip value added to lane1 before MLP norm, but not to lane state.
+**Hypothesis:** Skip might work as a temporary input augmentation without modifying residual stream.
+**Result:** val_loss=**3.2822**. Worse by 0.0045. Skip must persist in residual stream. **Reverted.**
+
+### Exp 95: Skip saves lane average instead of lane0
+**Config:** Exp 92 but `skip_connections.append((lane0 + lane1) * 0.5)` instead of lane0.
+**Hypothesis:** Average carries information from both streams for richer skip signal.
+**Result:** val_loss=**3.2803**. Worse by 0.003. Lane0 (attn stream) is the right source. **Reverted.**
+
+**Skip experiment summary:**
+- **Best: Exp 92** (skip through HC wp/rl) — val_loss=3.2775 (matches baseline)
+- Skip must: (1) persist to lane state, (2) go to both lanes, (3) save from lane0
+- Routing through HC wp/rl is clean and lets layer 6 HC params train
