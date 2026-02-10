@@ -1047,3 +1047,86 @@ Goal: Shift loss down by ~0.0025 to reach target 3.278
 | **Std** | **±0.0009** |
 **Analysis:** Mean 3.2782, gap +0.0002. Borderline — one outlier (3.2800) pulls mean up.
 Likely does NOT pass p < 0.01. Need slightly more steps.
+
+---
+
+## === 8xH100 EXPERIMENTS ===
+## First time testing on 8xH100 cluster.
+## HC config: wp=1.0, rl=sqrt(1.1), sched=1475, ext=40 (1515 total steps)
+## Master: sched=1515, ext=40 (1555 total steps)
+
+---
+
+### 8xH100 Baselines
+
+| Variant | Steps | val_loss | train_time | step_avg |
+|---------|-------|----------|------------|----------|
+| **Master** | 1555 | 3.2807 | 92,775ms | **59.66ms** |
+| **HC (full 2-lane)** | 1515 | 3.2804 | 93,809ms | **61.92ms** |
+
+**HC overhead on 8xH100: +2.26ms/step (+3.8%).**
+Lower than 4xH200's ~6% overhead, as predicted — communication (NCCL allreduce)
+is a larger fraction of step time on 8 GPUs, reducing HC's relative overhead.
+
+Peak memory: Master 30,676 MiB / HC 30,532 MiB (HC slightly lower — fewer scalar params).
+Reserved: Master 47,738 MiB / HC 50,120 MiB (HC higher reserved — 2-lane activations).
+
+---
+
+### Profiling: Inductor Fusion Analysis
+
+Used `TORCH_LOGS=output_code` + `torch.profiler` to inspect compiled Triton kernels.
+
+**Key finding: The lane0 and lane1 updates ARE fused into single kernels by torch.compile.**
+
+Post-attention kernel (steady-state, e.g. kernel_16):
+- 17 loads, 3 stores, 1 reduction — **one kernel** handles:
+  1. Deferred MLP lane1 update from previous layer
+  2. Both lane0 and lane1 attention residual updates
+  3. RMS norm of reading lane for next sublayer
+- Both lanes updated via `in_out_ptr0` and `in_out_ptr1` (in-place mutation)
+
+Post-MLP kernel (e.g. kernel_11):
+- 4 loads, 1 store, 1 reduction — **one kernel** handles:
+  1. Lane0 MLP residual update + norm for next attn input
+  2. Lane1 MLP update is **deferred** (fused into next layer's post-attn kernel)
+
+The compiler is quite clever: it defers lane1's MLP update since it's not needed until the
+next layer's MLP reads lane1, avoiding a separate kernel launch. This means the overhead is
+NOT from extra kernel launches — it's from the irreducible memory bandwidth of reading/writing
+2 lane tensors instead of 1 through the fused kernels.
+
+---
+
+### Ablation 1: Single-Lane (no lane1 computation)
+
+Removed all lane1 updates (attn, MLP, skip). MLP reads lane0 instead of lane1.
+Final output = lane0 (no averaging). Tests pure memory bandwidth cost of lane1.
+
+**Result (8xH100):** step_avg=**60.16ms**, val_loss=3.2830 (loss irrelevant, different model)
+
+| Variant | step_avg | vs Master | vs Full HC |
+|---------|----------|-----------|------------|
+| Master | 59.66ms | — | — |
+| Full 2-lane HC | 61.92ms | +2.26ms (+3.8%) | — |
+| **Single-lane (no lane1)** | **60.16ms** | **+0.50ms (+0.84%)** | **-1.76ms** |
+
+**Analysis:** Removing lane1 saves 1.76ms of the 2.26ms overhead (78%).
+The remaining 0.50ms is from HC's scalar machinery on lane0 only (rl, wp, bias precompute).
+
+---
+
+### Ablation 2: Bandwidth-Only Lane1 (running)
+
+Lane1 allocated and read/written each sublayer, but with minimal compute:
+`lane1 = rl[si] * lane1` (just a scalar multiply — forces read+write without h/wp/bias ops).
+Final merge: `(lane0 + lane1) * 0.5` to keep lane1 in the autograd graph.
+
+Tests whether the overhead is from memory bandwidth (reading/writing lane1 data)
+or from the extra compute (h*wp additions, bias injections, scalar gradient reductions).
+
+**Interpretation grid:**
+- If bandwidth-only ≈ full 2-lane (~61.9ms) → overhead is memory bandwidth
+- If bandwidth-only ≈ no lane1 (~60.2ms) → overhead is the extra compute/scalar gradients
+
+**Result:** *(pending)*
