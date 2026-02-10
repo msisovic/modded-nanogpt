@@ -1129,4 +1129,28 @@ or from the extra compute (h*wp additions, bias injections, scalar gradient redu
 - If bandwidth-only ≈ full 2-lane (~61.9ms) → overhead is memory bandwidth
 - If bandwidth-only ≈ no lane1 (~60.2ms) → overhead is the extra compute/scalar gradients
 
-**Result:** *(pending)*
+**Result (8xH100):** step_avg=**60.87ms**, val_loss=3.2930 (loss irrelevant, different model)
+
+| Variant | step_avg | vs Master | vs Full HC |
+|---------|----------|-----------|------------|
+| Master | 59.66ms | — | — |
+| Full 2-lane HC | 61.92ms | +2.26ms (+3.8%) | — |
+| Single-lane (no lane1) | 60.16ms | +0.50ms (+0.84%) | -1.76ms |
+| **Bandwidth-only lane1** | **60.87ms** | **+1.21ms (+2.0%)** | **-1.05ms** |
+
+**Analysis:** Bandwidth-only is between single-lane and full HC, landing at 60.87ms.
+This means the overhead is a **mix** of both memory bandwidth and extra compute:
+
+| Source | Cost | % of total overhead |
+|--------|------|---------------------|
+| Lane0 scalar machinery (rl, wp, bias) | +0.50ms | 22% |
+| Lane1 memory bandwidth (read+write per sublayer) | +0.71ms | 31% |
+| Lane1 extra compute (h*wp, bias, scalar gradients) | +1.05ms | 47% |
+| **Total HC overhead** | **+2.26ms** | **100%** |
+
+**Conclusion:** Nearly half the overhead (47%) comes from the extra compute and scalar
+gradient reductions on lane1, not just memory traffic. This suggests optimization paths:
+- **Sharing scalars across lanes** (e.g., single wp, single rl) would reduce scalar gradient
+  reductions and per-lane bias computations — targeting the 47% compute overhead.
+- **Sharing biases across lanes** would eliminate duplicate x0_bias/bigram_bias per lane.
+- Memory bandwidth (31%) is harder to reduce without fundamentally changing the 2-lane design.
