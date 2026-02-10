@@ -1121,11 +1121,10 @@ class GPT(nn.Module):
         self.hyper_w_post = nn.Parameter(1.0 * torch.ones(n_sublayers, self.n_lanes, 1))
         self.hyper_w_post.label = 'hyper_post'
 
-        self.hyper_x0_bias = nn.Parameter(torch.zeros(n_sublayers, self.n_lanes, 1))
+        self.hyper_x0_bias = nn.Parameter(torch.zeros(n_sublayers))
         self.hyper_x0_bias.label = 'hyper_x0_bias'
 
-        hyper_bigram_bias = 0.05 * torch.ones(n_sublayers, self.n_lanes, 1)
-        self.hyper_bigram_bias = nn.Parameter(hyper_bigram_bias)
+        self.hyper_bigram_bias = nn.Parameter(0.05 * torch.ones(n_sublayers))
         self.hyper_bigram_bias.label = 'hyper_bigram_bias'
 
         self.hyper_resid_lambda = nn.Parameter(1.1**0.5 * torch.ones(n_sublayers))
@@ -1167,10 +1166,8 @@ class GPT(nn.Module):
         # Unbind HC scalars per-sublayer per-lane (avoids select_backwards kernel)
         wp0 = self.hyper_w_post[:, 0, 0].bfloat16().unbind(0)
         wp1 = self.hyper_w_post[:, 1, 0].bfloat16().unbind(0)
-        xb0 = self.hyper_x0_bias[:, 0, 0].bfloat16().unbind(0)
-        xb1 = self.hyper_x0_bias[:, 1, 0].bfloat16().unbind(0)
-        bb0 = self.hyper_bigram_bias[:, 0, 0].bfloat16().unbind(0)
-        bb1 = self.hyper_bigram_bias[:, 1, 0].bfloat16().unbind(0)
+        xb = self.hyper_x0_bias.bfloat16().unbind(0)
+        bb = self.hyper_bigram_bias.bfloat16().unbind(0)
         rl = self.hyper_resid_lambda.bfloat16().unbind(0)
 
         # set block masks and key shift
@@ -1194,16 +1191,15 @@ class GPT(nn.Module):
         x = x0 = norm(x[None])
 
         # Initialize 2-lane residual stream with pre-layer-0 bigram injection
-        lane0 = x0 + x0_bigram * bb0[0]
-        lane1 = x0 + x0_bigram * bb1[0]
+        lane0 = x0 + x0_bigram * bb[0]
+        lane1 = x0 + x0_bigram * bb[0]
         # Zero out sublayer-0 bigram to avoid double injection in the loop
-        zero = bb0[0] * 0
-        bb0 = (zero,) + bb0[1:]
-        bb1 = (zero,) + bb1[1:]
+        zero = bb[0] * 0
+        bb = (zero,) + bb[1:]
 
         # Precompute bias terms outside loop (moves x0/bigram gradient computation off backward critical path)
-        hc_bias0 = tuple(x0 * xb0[2*i] + x0_bigram * bb0[2*i] for i in range(self.num_layers))
-        hc_bias1 = tuple(x0 * xb1[2*i] + x0_bigram * bb1[2*i] for i in range(self.num_layers))
+        # Bias-on-h: single bias added to h before wp multiply, distributed to lanes via wp0/wp1
+        hc_bias = tuple(x0 * xb[2*i] + x0_bigram * bb[2*i] for i in range(self.num_layers))
 
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
@@ -1238,8 +1234,9 @@ class GPT(nn.Module):
             si = 2 * i  # sublayer index for attn
             if block.attn is not None:
                 h = block.attn(norm(lane0), attn_args, qkvo_w)
-                lane0 = rl[si] * lane0 + h * wp0[si] + hc_bias0[i]
-                lane1 = rl[si] * lane1 + h * wp1[si] + hc_bias1[i]
+                h = h + hc_bias[i]  # bias-on-h: single bias distributed to lanes via wp
+                lane0 = rl[si] * lane0 + h * wp0[si]
+                lane1 = rl[si] * lane1 + h * wp1[si]
             if i in skip_in:
                 skip_connections.append(lane0)
             if block.mlp is not None:
@@ -1858,8 +1855,8 @@ if master_process:
     with torch.no_grad():
         # Load learned parameters (w_res=identity and w_pre=round-robin are hardcoded, not stored)
         w_post = model.hyper_w_post.float().cpu() # (Layers, n, 1)
-        x0_bias = model.hyper_x0_bias.float().cpu()  # (Layers, n, 1)
-        bigram_bias = model.hyper_bigram_bias.float().cpu()  # (Layers, n, 1)
+        x0_bias = model.hyper_x0_bias.float().cpu()  # (n_sublayers,)
+        bigram_bias = model.hyper_bigram_bias.float().cpu()  # (n_sublayers,)
         resid_lambda = model.hyper_resid_lambda.float().cpu()  # (Layers,)
 
         n_sublayers = w_post.shape[0]
@@ -1886,10 +1883,10 @@ if master_process:
             post_weights = w_post[idx].squeeze()
             print0(f"  [H_post] Write Strength: {post_weights.numpy()}", console=True)
 
-            x0_b = x0_bias[idx].squeeze()
-            xb_b = bigram_bias[idx].squeeze()
-            print0(f"  [x0_bias] Injection per Lane: {x0_b.numpy()}", console=True)
-            print0(f"  [bigram_bias] Injection per Lane: {xb_b.numpy()}", console=True)
+            x0_b = x0_bias[idx].item()
+            xb_b = bigram_bias[idx].item()
+            print0(f"  [x0_bias] Injection (shared, bias-on-h): {x0_b:.4f}", console=True)
+            print0(f"  [bigram_bias] Injection (shared, bias-on-h): {xb_b:.4f}", console=True)
             print0(f"  [resid_lambda] Gain: {resid_lambda[idx].item():.4f}", console=True)
 
             # H_res is frozen identity
