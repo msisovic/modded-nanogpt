@@ -1118,7 +1118,22 @@ class GPT(nn.Module):
         self.n_lanes = 2
         n_sublayers = 2 * num_layers
 
-        self.hyper_w_post = nn.Parameter(1.0 * torch.ones(n_sublayers, self.n_lanes, 1))
+        # Differentiated init based on learned weight patterns:
+        # - Attn wp1 → 2.5 in HC (learned 2.4-2.7, upward trend benefits from pushing higher)
+        # - Attn wp0 → 0.75 in HC (learned 0.5-0.9 in layers 8-9)
+        # - MLP wp0 → 0.5 everywhere (optimizer needs room to decay from higher init)
+        # - MLP wp1 → 0.5 in HC (0.25 init hurt despite matching learned value)
+        hc_start = 7
+        w_post_init = torch.ones(n_sublayers, self.n_lanes, 1)
+        for layer in range(num_layers):
+            si_mlp = 2 * layer + 1
+            w_post_init[si_mlp, 0, 0] = 0.5   # MLP wp0 (all layers)
+            if layer >= hc_start:
+                si_attn = 2 * layer
+                w_post_init[si_attn, 0, 0] = 0.75  # Attn wp0 (HC layers)
+                w_post_init[si_attn, 1, 0] = 2.5   # Attn wp1 (HC layers)
+                w_post_init[si_mlp, 1, 0] = 0.5    # MLP wp1 (HC layers)
+        self.hyper_w_post = nn.Parameter(w_post_init)
         self.hyper_w_post.label = 'hyper_post'
 
         self.hyper_x0_bias = nn.Parameter(torch.zeros(n_sublayers))
@@ -1476,7 +1491,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1495  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1470  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"

@@ -1385,3 +1385,111 @@ by copying lane0. Full 2-lane L7-10. Same step count as master for direct compar
 HC at just 4 layers (L7-10) beats master loss! Late-layer cross-lane routing is the
 core convergence mechanism. wp1 at L0-6 stayed at init (1.0, never used).
 Only 8 sublayers have dual lanes (vs 22 in full HC) — major per-step overhead reduction.
+
+---
+
+## Phase 9: w_post Init Tuning for Late-Only HC (8xH100)
+
+### Architecture recap
+Late-only HC: single-stream L0-6 (only lane0), full 2-lane L7-10.
+`hc_start=7`. Lane1 introduced at L7 by copying lane0.
+Master baseline (8xH100): val_loss=3.2807, train_time=92,775ms @ 1555 steps (step_avg=59.66ms)
+
+---
+
+### Exp 109: First record-beating run (uniform wp init=1.0)
+**Config:** Late-only HC, sched=1475, ext=40 (1515 total), wp init=1.0 for all sublayers.
+**Result (8xH100):** val_loss=**3.2794**, train_time=**92,426ms**, step_avg=61.01ms
+**First record!** Beats master on both val_loss (-0.0013) and wall time (-349ms).
+
+**Learned w_post weights (uniform init=1.0):**
+```
+Layer Type  si      rl     wp0     wp1  |diff|    x0_b      bb
+-----------------------------------------------------------------
+    7 attn  14  0.6877  0.9914  1.3937  0.4023  0.7402  0.3194
+    7  mlp  15  1.1052  0.6850  0.6438  0.0412  0.0000  0.0500
+    8 attn  16  0.9089  0.7224  1.9524  1.2300  0.0418 -0.2057
+    8  mlp  17  1.0278  0.1540  0.6128  0.4588  0.0000  0.0500
+    9 attn  18  0.8163  0.8758  1.9852  1.1094 -0.1988 -0.1152
+    9  mlp  19  0.9320  0.0248  0.6245  0.5998  0.0000  0.0500
+   10 attn  20  0.6625  1.4544  2.2998  0.8454 -0.8628  0.4887
+   10  mlp  21  1.4320  0.4760  0.4760  0.0000  0.0000  0.0500
+```
+
+**Key patterns identified:**
+- **Attn wp1 → ~2.0** (1.39, 1.95, 1.99, 2.30) — strong signal from attn into lane1 (MLP stream)
+- **Attn wp0 ≈ 1.0** (0.99, 0.72, 0.88, 1.45) — noisy, stays near init
+- **MLP wp0 → ~0.5 everywhere** (single-stream: 0.19-0.58, HC: 0.03-0.69) — MLP output weakly feeds lane0
+- **MLP wp1 → ~0.5** (HC: 0.48-0.64) — moderate MLP self-feedback into lane1
+
+---
+
+### Exp 110: Differentiated wp init (attn wp1=2.0, MLP wp0=0.5)
+**Config:** Exp 109 + differentiated w_post init based on learned patterns:
+- Single-stream MLP wp0: 1.0 → 0.5
+- HC attn wp0: 1.0 (unchanged), wp1: 1.0 → **2.0**
+- HC MLP wp0: 1.0 → **0.5**, wp1: 1.0 → **0.5**
+**Hypothesis:** Initing closer to learned values reduces optimizer work, faster convergence.
+**Result (8xH100):** val_loss=**3.2796**, train_time=**92,197ms**, step_avg=61.06ms @ 1510 steps
+Reduced step count by 5 (sched=1470). Essentially tied on loss, saved wall time.
+
+**Learned weights shifted further from init (confirming trends):**
+```
+Layer Type  si      rl     wp0     wp1
+-----------------------------------------------------------------
+    7 attn  14  0.8322  0.9355  2.3795
+    7  mlp  15  1.0811  0.0318  0.2572
+    8 attn  16  0.9786  0.5248  2.5434
+    8  mlp  17  1.0506  0.0884  0.2801
+    9 attn  18  0.9030  0.4428  2.5978
+    9  mlp  19  0.8965  0.0348  0.3135
+   10 attn  20  0.7091  1.4004  2.7397
+   10  mlp  21  1.4159  0.2283  0.2283
+```
+
+**Updated patterns (init 1.0→2.0 for attn wp1, 1.0→0.5 for MLP):**
+- Attn wp1 still climbing: 2.38, 2.54, 2.60, 2.74 (wants even higher than 2.0 init)
+- Attn wp0 dropping in L8-9: 0.52, 0.44 (wants ~0.5-0.75)
+- MLP wp0 dropped further: 0.03, 0.09, 0.03, 0.23 (wants ~0, optimizer decays from 0.5)
+- MLP wp1 dropped to: 0.26, 0.28, 0.31, 0.23 (near 0.25)
+
+---
+
+### Exp 111: MLP wp1 init = 0.25 (accidental, meant to test wp0)
+**Config:** Exp 110 + HC MLP wp1: 0.5 → 0.25 (user meant to change wp0 instead)
+**Result (8xH100):** val_loss=**3.2814**, train_time=91,899ms @ 1510 steps
+**WORSE** (+0.0018 vs Exp 110). Despite 0.25 matching learned MLP wp1 values (~0.23-0.31),
+initing closer to the learned value hurt performance.
+
+**Key insight: Init closer to learned value ≠ better.**
+The optimizer benefits from starting MLP weights higher (0.5) and decaying down.
+The learning trajectory (exploration from 0.5→0.25) matters, not just the destination.
+This constrains future init tuning — aggressive lowering of MLP inits is counterproductive.
+
+---
+
+### Exp 112: More aggressive attn init (wp0=0.75, wp1=2.5), MLP kept at 0.5
+**Config:** Exp 110 + targeted changes informed by Exp 111 lesson:
+- HC attn wp0: 1.0 → **0.75** (learned 0.52-0.94, mean ~0.7 in L8-9)
+- HC attn wp1: 2.0 → **2.5** (learned 2.38-2.74, clear upward trend)
+- MLP wp0: 0.5 (unchanged — optimizer needs decay room)
+- MLP wp1: 0.5 (unchanged — 0.25 hurt in Exp 111)
+**Hypothesis:** Attn weights trend upward from init, so pushing higher should help.
+MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
+**Status:** Running.
+
+---
+
+### w_post Init Tuning Summary
+| Exp | Attn wp0 | Attn wp1 | MLP wp0 | MLP wp1 | val_loss | Steps |
+|-----|----------|----------|---------|---------|----------|-------|
+| 109 | 1.0 | 1.0 | 1.0 | 1.0 | **3.2794** | 1515 |
+| **110** | **1.0** | **2.0** | **0.5** | **0.5** | **3.2796** | **1510** |
+| 111 | 1.0 | 2.0 | 0.5 | 0.25 | 3.2814 | 1510 |
+| 112 | 0.75 | 2.5 | 0.5 | 0.5 | *running* | 1510 |
+
+**Key findings:**
+1. **Attn wp1 → 2.0 init helped** (allowed 5-step reduction while maintaining loss)
+2. **MLP wp0 → 0.5 init helped** (matches universal learned pattern across all layers)
+3. **MLP wp1 → 0.25 HURT** despite matching learned values — optimizer trajectory matters
+4. Attn weights benefit from higher init (upward learning trend), MLP from moderate init (downward trend)
