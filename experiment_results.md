@@ -1288,3 +1288,28 @@ torch.compile didn't actually eliminate the lane1 ops (still in the graph from o
 **Result:** val_loss=**3.2883** (+0.011), train_time=**328,604ms** (-1,139ms!)
 **Analysis:** First real time savings! Skipping 4 lane ops saves ~1.1s.
 But loss too high — lane1 goes stale for 2 layers (misses rl decay + h injection).
+
+### Exp 100: Single-stream layers 4-5 (MLP reads lane0)
+**Config:** At layers 4-5: attn writes lane0 only, MLP reads lane0 (not stale lane1), writes lane0 only.
+Lane1 completely frozen through these layers.
+**Result:** val_loss=**3.2850** (+0.007), train_time=**328,489ms** (-1,254ms)
+
+### Exp 101: Single-stream layers 4-7
+**Config:** Expanded single-stream to layers 4-7.
+**Result:** val_loss=**3.2936** (+0.016), train_time=**327,852ms** (-1,891ms)
+Layer 7 has |diff|=0.50 — it needs HC. Too aggressive.
+
+### Exp 102: Single-stream layers 4-6
+**Config:** Single-stream layers 4-6 (layer 6 is skip layer with minimal HC differentiation).
+**Result:** val_loss=**3.2861** (+0.008), train_time=**327,940ms** (-1,803ms)
+
+### Selective HC Summary
+| Exp | Layers | train_time | Δtime | val_loss | Δloss |
+|-----|--------|------------|-------|----------|-------|
+| baseline | — | 329,743ms | — | 3.2777 | — |
+| 100 | 4-5 single | 328,489ms | -1,254ms | 3.2850 | +0.007 |
+| 102 | 4-6 single | 327,940ms | -1,803ms | 3.2861 | +0.008 |
+| 101 | 4-7 single | 327,852ms | -1,891ms | 3.2936 | +0.016 |
+
+**Best tradeoff: Exp 102** (layers 4-6): -1.8s for +0.008 loss.
+At ~217ms/step, 1.8s buys ~8 extra steps to compensate.

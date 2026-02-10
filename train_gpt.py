@@ -1233,25 +1233,24 @@ class GPT(nn.Module):
                 lane0 = lane0 + skip_gate_out * skip_val
                 lane1 = lane1 + skip_gate_out * skip_val
 
-            # Exp 99: TRUE no-touch on cross lane for middle layers
-            # At attn: lane1 completely untouched. At MLP: lane0 completely untouched.
-            no_cross = (4, 5)
+            # Exp 102: Single-stream layers 4-6 only
+            single_stream = (4, 5, 6)
 
             if block.attn is not None:
                 h = block.attn(norm(lane0), attn_args, qkvo_w)
                 h = h + hc_bias[i]  # bias-on-h: single bias distributed to lanes via wp
                 lane0 = rl[si] * lane0 + h * wp0[si]
-                if i not in no_cross:
+                if i not in single_stream:
                     lane1 = rl[si] * lane1 + h * wp1[si]
-                # else: lane1 truly untouched — no read, no write
             if i in skip_in:
                 skip_connections.append(lane0)
             if block.mlp is not None:
-                h = block.mlp(norm(lane1), c_fc, c_proj)
-                if i not in no_cross:
-                    lane0 = rl[si+1] * lane0 + h * wp0[si+1]
-                # else: lane0 truly untouched — no read, no write
-                lane1 = rl[si+1] * lane1 + h * wp1[si+1]
+                # In single-stream layers, MLP reads lane0 (fresh) instead of lane1 (stale)
+                mlp_in = lane0 if i in single_stream else lane1
+                h = block.mlp(norm(mlp_in), c_fc, c_proj)
+                lane0 = rl[si+1] * lane0 + h * wp0[si+1]
+                if i not in single_stream:
+                    lane1 = rl[si+1] * lane1 + h * wp1[si+1]
             if i == backout_layer:
                 x_backout = lane0
 
