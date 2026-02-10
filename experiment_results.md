@@ -1260,4 +1260,31 @@ Layer 6 attn wp values now actually train instead of being stuck at init.
 **Skip experiment summary:**
 - **Best: Exp 92** (skip through HC wp/rl) — val_loss=3.2775 (matches baseline)
 - Skip must: (1) persist to lane state, (2) go to both lanes, (3) save from lane0
-- Routing through HC wp/rl is clean and lets layer 6 HC params train
+- Routing through HC wp/rl added 1.2s wall time for no loss benefit. **Reverted to simple skip.**
+
+---
+
+## Selective HC Experiments (2xH200)
+### Baseline: val_loss=3.2777, train_time=329,743ms @ 1515 steps
+
+### Exp 96: Skip lane1 update entirely at layers 4-5 attn
+**Config:** At layers 4-5 attn sublayers (|wp0-wp1|=0.02), don't update lane1 at all.
+**Result:** val_loss=**3.2868** (+0.009), train_time=329,821ms (no time savings!)
+**Analysis:** lane1 misses rl=0.48/0.47 decay → magnitude drift. No time saved because
+torch.compile didn't actually eliminate the lane1 ops (still in the graph from other sublayers).
+
+### Exp 97: Shared wp (wp0 for both lanes) at layers 4-5 attn
+**Config:** `lane1 = rl * lane1 + h * wp0` (use wp0 instead of wp1) at layers 4-5 attn.
+**Result:** val_loss=**3.2788** (+0.001), train_time=329,756ms (no time savings)
+**Analysis:** Still does full read-modify-write on lane1. Only saves one scalar grad reduction.
+
+### Exp 98: No cross-lane writes at layers 4-6 (rl only on cross lane)
+**Config:** Attn: `lane1 = rl * lane1` (no h*wp1). MLP: `lane0 = rl * lane0` (no h*wp0).
+**Result:** val_loss=**3.2909** (+0.013), train_time=330,126ms (no time savings!)
+**Analysis:** Still does `rl * lane` read-modify-write. Must truly NOT TOUCH the cross lane.
+
+### Exp 99: TRUE no-touch cross lane at layers 4-5
+**Config:** At layers 4-5: attn doesn't touch lane1 AT ALL, MLP doesn't touch lane0 AT ALL.
+**Result:** val_loss=**3.2883** (+0.011), train_time=**328,604ms** (-1,139ms!)
+**Analysis:** First real time savings! Skipping 4 lane ops saves ~1.1s.
+But loss too high — lane1 goes stale for 2 layers (misses rl decay + h injection).
