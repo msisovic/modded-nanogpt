@@ -1156,6 +1156,7 @@ class GPT(nn.Module):
         skip_out = [6] # no attn op on layer 6
         x_backout = None
         backout_layer = 7
+        # single_stream = {4, 5, 6}  # (disabled) these layers only update lane0, lane1 frozen
 
         # set lambdas (updated layout after removing resid/x0/bigram lambdas)
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)

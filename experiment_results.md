@@ -1341,3 +1341,31 @@ Extra steps cost more time than we saved. Loss still not recovered.
 Extra steps can't compensate — the loss degradation per removed lane op is too steep.
 The 2-lane architecture is load-bearing at every layer. Even low-differentiation layers
 (|wp0-wp1|=0.02) contribute meaningful gradient paths that aid convergence.
+
+---
+
+## Phase 7: Scheduled Steps Increase with Single-Stream (L4-6)
+
+Testing whether increasing *scheduled* steps (which changes LR schedule) rather than extension
+steps can recover the ~0.008 loss from single-stream L4-6.
+
+### Exp 106: Single-stream L4-6, sched=1480 (+5), ext=40 (1520 total)
+**Config:** Same as Exp 102 but with 5 more scheduled steps (affects LR cooldown schedule).
+**Result:** val_loss=**3.2863** (+0.009), train_time=**329,222ms**
+Loss essentially unchanged from Exp 102 (3.2861). Extra steps just cost wall time.
+
+### Exp 107: Single-stream L4-6, sched=1485 (+10), ext=40 (1525 total)
+**Config:** 10 more scheduled steps than baseline.
+**Result:** val_loss=**3.2857** (+0.008), train_time=**330,148ms**
+Tiny improvement vs Exp 106 but still same loss as Exp 102. +6.4s wall time wasted.
+
+### Scheduled Steps Conclusion
+| Exp | sched | total | train_time | val_loss | Δloss |
+|-----|-------|-------|------------|----------|-------|
+| 102 | 1475 | 1515 | 327,940ms | 3.2861 | +0.008 |
+| 106 | 1480 | 1520 | 329,222ms | 3.2863 | +0.009 |
+| 107 | 1485 | 1525 | 330,148ms | 3.2857 | +0.008 |
+
+**Verdict:** Increasing scheduled steps (not extension) does NOT recover single-stream loss.
+The ~0.008 loss degradation from removing lane1 at L4-6 is structural, not a training
+duration issue. More LR budget can't fix information that simply isn't flowing through lane1.
