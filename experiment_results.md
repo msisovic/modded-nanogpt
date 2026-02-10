@@ -1154,3 +1154,29 @@ gradient reductions on lane1, not just memory traffic. This suggests optimizatio
   reductions and per-lane bias computations — targeting the 47% compute overhead.
 - **Sharing biases across lanes** would eliminate duplicate x0_bias/bigram_bias per lane.
 - Memory bandwidth (31%) is harder to reduce without fundamentally changing the 2-lane design.
+
+---
+
+### Optimization Attempts: Sharing Scalars/Biases
+
+Three approaches tested to reduce the 47% compute overhead:
+
+| Variant | step_avg | vs Master | vs Full HC | val_loss |
+|---------|----------|-----------|------------|----------|
+| Full 2-lane HC (baseline) | 61.92ms | +2.26ms | — | 3.2804 |
+| Shared bias (same hc_bias for both lanes) | 62.24ms | +2.58ms | **+0.32ms worse** | 3.2798 |
+| Bias-on-h (add bias to sublayer output before lane expansion) | 61.81ms | +2.15ms | **-0.11ms** | 3.2781 |
+| Per-layer rl (rl once per layer, init 1.1, not per sublayer) | 61.77ms | +2.11ms | **-0.15ms** | 3.2818 |
+
+**Shared bias** was slower — gradient fan-in from both lanes consuming the same
+`hc_bias[i]` tensor changed inductor's fusion decisions for the worse.
+
+**Bias-on-h** gave a small 0.11ms win by adding bias to `h` before `h*wp` lane expansion,
+avoiding the fan-in. Single consumer of hc_bias, naturally distributed via wp.
+
+**Per-layer rl** saved 0.15ms by halving resid_lambda multiplies (11 vs 22), but val_loss
+regressed (+0.0014 vs full HC). The per-sublayer granularity may matter for quality.
+
+**Conclusion:** These scalar-level optimizations yield diminishing returns (0.1-0.15ms).
+The bulk of the overhead is fundamental: lane1 memory bandwidth (0.71ms) and the per-lane
+`h * wp` multiplications + their backward gradients.
