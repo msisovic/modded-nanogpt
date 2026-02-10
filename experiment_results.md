@@ -1369,3 +1369,19 @@ Tiny improvement vs Exp 106 but still same loss as Exp 102. +6.4s wall time wast
 **Verdict:** Increasing scheduled steps (not extension) does NOT recover single-stream loss.
 The ~0.008 loss degradation from removing lane1 at L4-6 is structural, not a training
 duration issue. More LR budget can't fix information that simply isn't flowing through lane1.
+
+---
+
+## Phase 8: Late-Only HC (2-lane only at last few layers)
+
+Key insight from weight analysis: late layers (L7-10) show massive cross-lane routing
+(L9 attn: wp0=0.55, wp1=2.13). Early layers use HC mainly for rl amplification which
+works fine on a single stream. Strategy: single-stream L0-6, full 2-lane L7-10.
+
+### Exp 108: Late-only HC (L7-10), sched=1515, ext=40 (1555 total — matches master)
+**Config:** Single-stream L0-6 (only lane0, MLP reads lane0). lane1 introduced at L7
+by copying lane0. Full 2-lane L7-10. Same step count as master for direct comparison.
+**Result:** val_loss=**3.2747** (master=3.2769, **-0.002 BETTER**), train_time=**333,815ms**
+HC at just 4 layers (L7-10) beats master loss! Late-layer cross-lane routing is the
+core convergence mechanism. wp1 at L0-6 stayed at init (1.0, never used).
+Only 8 sublayers have dual lanes (vs 22 in full HC) — major per-step overhead reduction.

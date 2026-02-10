@@ -1156,7 +1156,7 @@ class GPT(nn.Module):
         skip_out = [6] # no attn op on layer 6
         x_backout = None
         backout_layer = 7
-        # single_stream = {4, 5, 6}  # (disabled) these layers only update lane0, lane1 frozen
+        hc_start = 7  # layer where we introduce lane1 (single-stream before this)
 
         # set lambdas (updated layout after removing resid/x0/bigram lambdas)
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
@@ -1191,9 +1191,10 @@ class GPT(nn.Module):
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
-        # Initialize 2-lane residual stream with pre-layer-0 bigram injection
+        # Initialize residual stream with pre-layer-0 bigram injection
+        # lane1 introduced at hc_start layer (single-stream before that)
         lane0 = x0 + x0_bigram * bb[0]
-        lane1 = x0 + x0_bigram * bb[0]
+        lane1 = None
         # Zero out sublayer-0 bigram to avoid double injection in the loop
         zero = bb[0] * 0
         bb = (zero,) + bb[1:]
@@ -1228,23 +1229,41 @@ class GPT(nn.Module):
             block = self.blocks[i]
             si = 2 * i  # sublayer index for attn
 
+            # Introduce lane1 at hc_start by copying lane0
+            if i == hc_start:
+                lane1 = lane0
+
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
                 skip_val = skip_connections.pop()
                 lane0 = lane0 + skip_gate_out * skip_val
-                lane1 = lane1 + skip_gate_out * skip_val
+                if lane1 is not None:
+                    lane1 = lane1 + skip_gate_out * skip_val
 
-            if block.attn is not None:
-                h = block.attn(norm(lane0), attn_args, qkvo_w)
-                h = h + hc_bias[i]  # bias-on-h: single bias distributed to lanes via wp
-                lane0 = rl[si] * lane0 + h * wp0[si]
-                lane1 = rl[si] * lane1 + h * wp1[si]
-            if i in skip_in:
-                skip_connections.append(lane0)
-            if block.mlp is not None:
-                h = block.mlp(norm(lane1), c_fc, c_proj)
-                lane0 = rl[si+1] * lane0 + h * wp0[si+1]
-                lane1 = rl[si+1] * lane1 + h * wp1[si+1]
+            if i < hc_start:
+                # Single-stream: only lane0, MLP also reads lane0
+                if block.attn is not None:
+                    h = block.attn(norm(lane0), attn_args, qkvo_w)
+                    h = h + hc_bias[i]
+                    lane0 = rl[si] * lane0 + h * wp0[si]
+                if i in skip_in:
+                    skip_connections.append(lane0)
+                if block.mlp is not None:
+                    h = block.mlp(norm(lane0), c_fc, c_proj)
+                    lane0 = rl[si+1] * lane0 + h * wp0[si+1]
+            else:
+                # Full 2-lane HC
+                if block.attn is not None:
+                    h = block.attn(norm(lane0), attn_args, qkvo_w)
+                    h = h + hc_bias[i]
+                    lane0 = rl[si] * lane0 + h * wp0[si]
+                    lane1 = rl[si] * lane1 + h * wp1[si]
+                if i in skip_in:
+                    skip_connections.append(lane0)
+                if block.mlp is not None:
+                    h = block.mlp(norm(lane1), c_fc, c_proj)
+                    lane0 = rl[si+1] * lane0 + h * wp0[si+1]
+                    lane1 = rl[si+1] * lane1 + h * wp1[si+1]
             if i == backout_layer:
                 x_backout = lane0
 
@@ -1457,7 +1476,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1475  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1515  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
