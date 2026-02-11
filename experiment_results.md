@@ -1621,3 +1621,17 @@ Significant improvement over 1510-step config (mean 3.2791 → 3.2788).
 **TARGET HIT! Mean 3.2779 ≤ 3.278!** 4/5 runs below 3.278.
 Previous best at 1510 steps: mean 3.2791. Adding 5 scheduled steps pushed mean from 3.2791 → 3.2779.
 Best single run: 3.2765 (well below target).
+
+---
+
+### Exp 155 (TODO): hc_start sweep at sched=1475 (1515 total steps)
+**Motivation:** The hc_start comparison (Exps 130-134) was done at 1510 steps. The winning hc_start=5 was then tested at 1515 steps (Exp 154) and hit the target. But hc_start 4, 6, 7 were never tested at 1515 steps — need apples-to-apples comparison.
+
+**Plan:** Run hc_start=4, 6, 7 (all with attn wp1=1.5) at sched=1475 (1515 total steps).
+
+| hc_start | val_loss @ 1510 | val_loss @ 1515 (TODO) |
+|----------|-----------------|------------------------|
+| 4 | 3.2809 | ? |
+| **5** | **3.2791** | **3.2779 (5-run mean)** |
+| 6 | 3.2804 | ? |
+| 7 | 3.2806 | ? |
