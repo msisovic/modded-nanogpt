@@ -1574,5 +1574,16 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 
 ### Exp 152: hc_start=5, attn wp1=1.5, sched=1480 (1520 total)
 **Config:** Best w_post config + 10 more scheduled steps (1480 vs 1470).
-**Result (8xH100):** val_loss=**3.2786**, step_avg=408.12ms
-**Analysis:** Excellent! Just 0.0006 above target. More steps help. Running repeats.
+**5-run results (8xH100):**
+| Run | val_loss |
+|-----|----------|
+| 1 | 3.2786 |
+| 2 | 3.2809 |
+| 3 | **3.2780** |
+| 4 | 3.2798 |
+| 5 | **3.2769** |
+| **Mean** | **3.2788** |
+| **Std** | **±0.0015** |
+**Analysis:** Mean 3.2788, gap +0.0008 from target. 2/5 runs below 3.278!
+Significant improvement over 1510-step config (mean 3.2791 → 3.2788).
+Trying sched=1485 (1525 total) for more steps.
