@@ -1586,4 +1586,19 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 | **Std** | **±0.0015** |
 **Analysis:** Mean 3.2788, gap +0.0008 from target. 2/5 runs below 3.278!
 Significant improvement over 1510-step config (mean 3.2791 → 3.2788).
-Trying sched=1485 (1525 total) for more steps.
+**NOTE: >1515 steps is informative only — ext=40 is fixed, max sched=1475 for wall time target.**
+
+### Exp 153: hc_start=5, attn wp1=1.5, sched=1485 (1525 total) — informative only
+**Config:** 5 more steps than Exp 152.
+**3-run results (8xH100):** 3.2792, **3.2768**, 3.2787
+**Mean (3 runs): 3.2782** — tantalizing, but above step budget.
+
+---
+
+### Step count constraint (from user)
+- **num_extension_iterations = 40** (fixed, cannot be changed)
+- **Max total steps = 1515** (sched=1475 + ext=40) unless per-step time is reduced
+- Experiments above 1515 are informative for understanding loss vs steps tradeoff
+- To hit 3.278 at 1515 steps, need either better init or faster per-step time to allow more steps
+
+**Reverted to sched=1475 (1515 total).** Continuing init search at this step count.
