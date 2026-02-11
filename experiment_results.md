@@ -1566,3 +1566,13 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 **Config:** Only late HC layers (L7-10) get wp1=1.5 boost. L5-6 stay at 1.0.
 **Result (8xH100):** val_loss=**3.2795**, step_avg=410.21ms
 **Analysis:** Very close to best! L5-6 don't need wp1 boost. But flat 1.5 is still marginally better.
+
+### Exp 151: hc_start=5, attn+MLP wp1=1.5 (all sublayers boosted)
+**Config:** Both attn and MLP wp1=1.5 at all HC layers.
+**Result (8xH100):** val_loss=**3.2823**, step_avg=410.06ms
+**Analysis:** MLP wp1=1.5 hurts. Confirms attn-only wp1 boost is correct.
+
+### Exp 152: hc_start=5, attn wp1=1.5, sched=1480 (1520 total)
+**Config:** Best w_post config + 10 more scheduled steps (1480 vs 1470).
+**Result (8xH100):** val_loss=**3.2786**, step_avg=408.12ms
+**Analysis:** Excellent! Just 0.0006 above target. More steps help. Running repeats.

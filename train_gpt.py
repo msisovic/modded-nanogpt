@@ -1123,15 +1123,13 @@ class GPT(nn.Module):
         # - Attn wp0 → 0.75 in HC (learned 0.5-0.9 in layers 8-9)
         # - MLP wp0 → 0.5 everywhere (optimizer needs room to decay from higher init)
         # - MLP wp1 → 0.5 in HC (0.25 init hurt despite matching learned value)
-        # Exp 151: hc_start=5, attn wp1=1.5, MLP wp1=1.5 (all sublayers boosted)
+        # Exp 152: hc_start=5, attn wp1=1.5, sched=1480 (1520 total)
         hc_start = 5
         w_post_init = torch.ones(n_sublayers, self.n_lanes, 1)
         for layer in range(num_layers):
             if layer >= hc_start:
                 si_attn = 2 * layer
-                si_mlp = 2 * layer + 1
                 w_post_init[si_attn, 1, 0] = 1.5  # HC attn wp1
-                w_post_init[si_mlp, 1, 0] = 1.5   # HC MLP wp1
         self.hyper_w_post = nn.Parameter(w_post_init)
         self.hyper_w_post.label = 'hyper_post'
 
@@ -1490,7 +1488,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1470  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1480  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
