@@ -1539,3 +1539,15 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 4. **Best init: attn-only wp1=1.5, all else 1.0** — mild asymmetry for lane1 injection
 5. **Attn wp1=1.5 > 2.0 > 1.25**: sweet spot is 1.5 for HC attn asymmetry
 6. **MLP should stay at 1.0**: adding MLP wp1=1.5 slightly worse than attn-only
+
+---
+
+### Exp 146: hc_start=5, attn wp1=1.5, ext=35 (1505 total, save wall time)
+**Config:** Best config but with num_extension_iterations=35 (1505 total steps instead of 1510).
+**Result (8xH100):** val_loss=**3.2810**, step_avg=413.47ms
+**Analysis:** Worse than 1510-step baseline (mean 3.2791). Fewer extension steps hurts. **Reverted ext to 40.**
+
+### Exp 147: hc_start=5, attn wp1=1.4 (fine-tune below 1.5)
+**Config:** Same as best but attn wp1=1.4 instead of 1.5.
+**Result (8xH100):** val_loss=**3.2825**, step_avg=409.77ms
+**Analysis:** Significantly worse than 1.5 (mean 3.2791). Less asymmetry hurts. 1.5 remains sweet spot.

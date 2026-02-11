@@ -1123,16 +1123,13 @@ class GPT(nn.Module):
         # - Attn wp0 → 0.75 in HC (learned 0.5-0.9 in layers 8-9)
         # - MLP wp0 → 0.5 everywhere (optimizer needs room to decay from higher init)
         # - MLP wp1 → 0.5 in HC (0.25 init hurt despite matching learned value)
-        hc_start = 7
+        # Exp 148: hc_start=5, attn wp1=1.6 (fine-tune around 1.5)
+        hc_start = 5
         w_post_init = torch.ones(n_sublayers, self.n_lanes, 1)
         for layer in range(num_layers):
-            si_mlp = 2 * layer + 1
-            w_post_init[si_mlp, 0, 0] = 0.5   # MLP wp0 (all layers)
             if layer >= hc_start:
                 si_attn = 2 * layer
-                w_post_init[si_attn, 0, 0] = 0.75  # Attn wp0 (HC layers)
-                w_post_init[si_attn, 1, 0] = 2.5   # Attn wp1 (HC layers)
-                w_post_init[si_mlp, 1, 0] = 0.5    # MLP wp1 (HC layers)
+                w_post_init[si_attn, 1, 0] = 1.6  # HC attn wp1
         self.hyper_w_post = nn.Parameter(w_post_init)
         self.hyper_w_post.label = 'hyper_post'
 
@@ -1171,7 +1168,7 @@ class GPT(nn.Module):
         skip_out = [6] # no attn op on layer 6
         x_backout = None
         backout_layer = 7
-        hc_start = 7  # layer where we introduce lane1 (single-stream before this)
+        hc_start = 5  # layer where we introduce lane1 (single-stream before this)
 
         # set lambdas (updated layout after removing resid/x0/bigram lambdas)
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
