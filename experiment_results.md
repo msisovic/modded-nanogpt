@@ -1496,18 +1496,15 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 | 119 | 1.0 | 2.5 | 0.5 | 0.75 | 3.2815 | 1510 |
 | 120 | 1.0 | 1.0 | 0.5 | 1.0 | 3.2811 | 1510 |
 | 121 | 1.5 | 1.5 | 1.5 | 1.5 | 3.2806 | 1510 |
-| 122 | 0.5 | 0.5 | 0.5 | 0.5 | *running* | 1510 |
+| 122 | 0.5 | 0.5 | 0.5 | 0.5 | 3.2879 | 1510 |
+| 123 | 2.0 | 2.0 | 2.0 | 2.0 | 3.2818 | 1510 |
+| 124 | 1.0 | 1.5 | 1.0 | 1.5 | *running* | 1510 |
 
 **Key findings:**
-1. **Attn wp1 → 2.0 init helped** (allowed 5-step reduction while maintaining loss)
-2. **MLP wp0 → 0.5 init helped** (matches universal learned pattern across all layers)
-3. **MLP wp1 → 0.25 HURT** despite matching learned values — optimizer trajectory matters
-4. Attn weights benefit from higher init (upward learning trend), MLP from moderate init (downward trend)
-5. **wp1=3.0 with wp0=0.75 or 0.5**: 3.2815/3.2817 — marginal improvement over 112 (3.2830), run variance likely
-6. **Exp 114: wp0=0.5 caused L7 attn wp0 to go negative (-0.41)** — too low init destabilizes early HC layers
-7. **MLP wp0=0.25 didn't help** (Exp 116: 3.2829) — MLP needs 0.5 headroom
-8. **All-1.0 init (Exp 118: 3.2804)** still competitive — differentiated init may not be reliably better
-9. **Ramped wp1 (Exp 117: 3.2824)** — no benefit from layer-specific attn wp1
-10. **Uniform 1.5 (Exp 121: 3.2806)** — nearly tied with 1.0, uniform init is robust
-11. **All-1.0 + MLP wp0=0.5 (Exp 120: 3.2811)** — targeted MLP change didn't improve over pure 1.0
-6. **Exp 114: wp0=0.5 caused L7 attn wp0 to go negative (-0.41)** — too low init destabilizes early HC layers
+1. **Uniform init scale matters**: 1.0 (3.2804) ≈ 1.5 (3.2806) > 2.0 (3.2818) >> 0.5 (3.2879)
+2. **All-1.0 init (Exp 118: 3.2804)** — best single-run result, simple and effective
+3. **Differentiated inits haven't beaten uniform 1.0** — optimizer trajectory from 1.0 is optimal
+4. **MLP wp0 always decays to near 0** regardless of init (0.5→0.04, 1.0→0.18, 0.25→0.02)
+5. **Attn wp1 always grows high** from any init (1.0→2.35, 2.0→2.54, 3.0→3.48)
+6. **Uniform 0.5 is too low** — attn wp1 can't climb high enough (only reaches 1.42)
+7. Previous finding: MLP wp1 → 0.25 HURT despite matching learned values — optimizer trajectory matters
