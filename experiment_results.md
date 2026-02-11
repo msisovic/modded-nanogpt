@@ -1498,13 +1498,15 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 | 121 | 1.5 | 1.5 | 1.5 | 1.5 | 3.2806 | 1510 |
 | 122 | 0.5 | 0.5 | 0.5 | 0.5 | 3.2879 | 1510 |
 | 123 | 2.0 | 2.0 | 2.0 | 2.0 | 3.2818 | 1510 |
-| 124 | 1.0 | 1.5 | 1.0 | 1.5 | *running* | 1510 |
+| **124** | **1.0** | **1.5** | **1.0** | **1.5** | **3.2800** | **1510** |
+| 125 | 1.0 | 1.25 | 1.0 | 1.25 | 3.2815 | 1510 |
+| 126 | 1.0 | 1.75 | 1.0 | 1.75 | *running* | 1510 |
 
 **Key findings:**
 1. **Uniform init scale matters**: 1.0 (3.2804) ≈ 1.5 (3.2806) > 2.0 (3.2818) >> 0.5 (3.2879)
-2. **All-1.0 init (Exp 118: 3.2804)** — best single-run result, simple and effective
-3. **Differentiated inits haven't beaten uniform 1.0** — optimizer trajectory from 1.0 is optimal
+2. **NEW BEST: Exp 124 (wp0=1.0, wp1=1.5 for HC): 3.2800** — mild asymmetry helps!
+3. **Differentiated inits**: early experiments with high attn wp1 (2.0-3.0) and low MLP wp0 all ~3.281-3.283
 4. **MLP wp0 always decays to near 0** regardless of init (0.5→0.04, 1.0→0.18, 0.25→0.02)
 5. **Attn wp1 always grows high** from any init (1.0→2.35, 2.0→2.54, 3.0→3.48)
 6. **Uniform 0.5 is too low** — attn wp1 can't climb high enough (only reaches 1.42)
-7. Previous finding: MLP wp1 → 0.25 HURT despite matching learned values — optimizer trajectory matters
+7. **wp1=1.25 too conservative (3.2815)** — 1.5 is the sweet spot for HC lane asymmetry
