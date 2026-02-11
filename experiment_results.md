@@ -1512,7 +1512,8 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 | 135 | 1.0 | 1.5(attn only) | 0.5 | 1.0 | 3.2796 (hc_start=5) | 1510 |
 | 136 | 1.0 | 1.75(attn only) | 1.0 | 1.0 | 3.2788 (hc_start=5) | 1510 |
 | 137 | 1.25(SS) | 1.5(attn only) | 1.0 | 1.0 | 3.2785 (hc5, SS attn wp0=1.25) | 1510 |
-| 138 | 1.5(SS) | 1.5(attn only) | 1.0 | 1.0 | *running* (hc5, SS attn wp0=1.5) | 1510 |
+| 138 | 1.5(SS) | 1.5(attn only) | 1.0 | 1.0 | 3.2803 (hc5, SS too high) | 1510 |
+| 139 | 1.0 | 1.5(attn) | 1.0 | 1.25(HC MLP) | *running* (hc5) | 1510 |
 
 **Exp 131/133 mean: 3.2788 ± 0.0003** (attn-only wp1=1.5, hc_start=5)
 **Exp 127/128 mean: 3.2806 ± 0.0011** (attn-only wp1=1.5, hc_start=7)
