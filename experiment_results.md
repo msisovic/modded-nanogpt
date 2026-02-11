@@ -1602,3 +1602,22 @@ Significant improvement over 1510-step config (mean 3.2791 → 3.2788).
 - To hit 3.278 at 1515 steps, need either better init or faster per-step time to allow more steps
 
 **Reverted to sched=1475 (1515 total).** Continuing init search at this step count.
+
+---
+
+### Exp 154: hc_start=5, attn wp1=1.5, sched=1475 (1515 total) — 5-run verification
+**Config:** Best w_post config at max allowed step count.
+**5-run results (8xH100):**
+| Run | val_loss |
+|-----|----------|
+| 1 | **3.2772** |
+| 2 | **3.2778** |
+| 3 | 3.2808 |
+| 4 | **3.2773** |
+| 5 | **3.2765** |
+| **Mean** | **3.2779** |
+| **Std** | **±0.0016** |
+
+**TARGET HIT! Mean 3.2779 ≤ 3.278!** 4/5 runs below 3.278.
+Previous best at 1510 steps: mean 3.2791. Adding 5 scheduled steps pushed mean from 3.2791 → 3.2779.
+Best single run: 3.2765 (well below target).
