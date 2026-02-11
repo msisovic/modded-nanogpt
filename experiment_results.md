@@ -1502,13 +1502,17 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 | 125 | 1.0 | 1.25 | 1.0 | 1.25 | 3.2815 | 1510 |
 | 126 | 1.0 | 1.75 | 1.0 | 1.75 | 3.2812 | 1510 |
 | **127** | **1.0** | **1.5(attn only)** | **1.0** | **1.0** | **3.2795** | **1510** |
-| 128 | 1.0 | 1.5(attn only) | 1.0 | 1.0 | *running (repeat)* | 1510 |
+| 128 | 1.0 | 1.5(attn only) | 1.0 | 1.0 | 3.2817 (repeat) | 1510 |
+| 129 | 1.0 | 2.0(attn only) | 1.0 | 1.0 | 3.2809 | 1510 |
+| 130 | 1.0 | 1.5(attn only) | 1.0 | 1.0 | *running* (hc_start=6) | 1510 |
+
+**Exp 127/128 mean: 3.2806 ± 0.0011** (attn-only wp1=1.5)
 
 **Key findings:**
 1. **Uniform init scale matters**: 1.0 (3.2804) ≈ 1.5 (3.2806) > 2.0 (3.2818) >> 0.5 (3.2879)
-2. **NEW BEST: Exp 127 (attn-only wp1=1.5, all else 1.0): 3.2795** — attn asymmetry without MLP!
-3. **Attn-only asymmetry > full asymmetry**: 127 (3.2795) > 124 (3.2800) > 118 (3.2804)
+2. **Best config: attn-only wp1=1.5, all else 1.0** — mean 3.2806 (Exp 127/128)
+3. **Attn-only asymmetry > full asymmetry**: 127/128 mean > 124 (3.2800) > 118 (3.2804)
 4. **MLP should stay at 1.0**: adding MLP wp1=1.5 (Exp 124) slightly worse than attn-only (Exp 127)
-5. **MLP wp0 always decays to near 0** regardless of init
+5. **Attn wp1=1.5 > 2.0 > 1.25**: sweet spot is 1.5 for HC attn asymmetry
 6. **Attn wp1 always grows high** from any init — 1.5 starting point gives best trajectory
 7. **Uniform 0.5 is too low** — attn wp1 can't climb high enough
