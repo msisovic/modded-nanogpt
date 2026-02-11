@@ -1516,9 +1516,10 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 | 139 | 1.0 | 1.5(attn) | 1.0 | 1.25(HC MLP) | 3.2819 (hc5, MLP wp1 boost hurts) | 1510 |
 | 140 | 1.0 | 1.5(attn only) | 1.0 | 1.0 | 3.2794 (hc5, 1475+40=1515 steps) | 1515 |
 | 141 | 1.25(SS) | 1.75(attn only) | 1.0 | 1.0 | 3.2800 (hc5) | 1510 |
-| 142 | 1.0 | 1.5(attn only) | 1.0 | 1.0 | *running* (hc5, 3rd run) | 1510 |
+| **142** | **1.0** | **1.5(attn only)** | **1.0** | **1.0** | **3.2781** (hc5, 3rd run, **BELOW 3.278!**) | **1510** |
 
-**Exp 131/133 mean: 3.2788 ± 0.0003** (attn-only wp1=1.5, hc_start=5)
+**Exp 131/133/142 mean: 3.2786 ± 0.0005** (attn-only wp1=1.5, hc_start=5)
+**Runs: 3.2785, 3.2791, 3.2781** — best single: 3.2781 (below target!)
 **Exp 127/128 mean: 3.2806 ± 0.0011** (attn-only wp1=1.5, hc_start=7)
 
 **hc_start sweep (with attn wp1=1.5):**
