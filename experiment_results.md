@@ -1551,3 +1551,18 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 **Config:** Same as best but attn wp1=1.4 instead of 1.5.
 **Result (8xH100):** val_loss=**3.2825**, step_avg=409.77ms
 **Analysis:** Significantly worse than 1.5 (mean 3.2791). Less asymmetry hurts. 1.5 remains sweet spot.
+
+### Exp 148: hc_start=5, attn wp1=1.6 (fine-tune above 1.5)
+**Config:** Same as best but attn wp1=1.6 instead of 1.5.
+**Result (8xH100):** val_loss=**3.2801**, step_avg=409.81ms
+**Analysis:** Better than 1.4 but still worse than 1.5 (mean 3.2791). 1.5 confirmed as sweet spot.
+
+### Exp 149: hc_start=5, ramped attn wp1 (1.25→1.75 across HC layers)
+**Config:** Linear ramp from 1.25 at L5 to 1.75 at L10.
+**Result (8xH100):** val_loss=**3.2805**, step_avg=410.22ms
+**Analysis:** Ramping doesn't help. Flat 1.5 is better.
+
+### Exp 150: hc_start=5, step function (L5-6: wp1=1.0, L7-10: wp1=1.5)
+**Config:** Only late HC layers (L7-10) get wp1=1.5 boost. L5-6 stay at 1.0.
+**Result (8xH100):** val_loss=**3.2795**, step_avg=410.21ms
+**Analysis:** Very close to best! L5-6 don't need wp1 boost. But flat 1.5 is still marginally better.

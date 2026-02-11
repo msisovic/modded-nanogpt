@@ -1123,13 +1123,15 @@ class GPT(nn.Module):
         # - Attn wp0 → 0.75 in HC (learned 0.5-0.9 in layers 8-9)
         # - MLP wp0 → 0.5 everywhere (optimizer needs room to decay from higher init)
         # - MLP wp1 → 0.5 in HC (0.25 init hurt despite matching learned value)
-        # Exp 148: hc_start=5, attn wp1=1.6 (fine-tune around 1.5)
+        # Exp 151: hc_start=5, attn wp1=1.5, MLP wp1=1.5 (all sublayers boosted)
         hc_start = 5
         w_post_init = torch.ones(n_sublayers, self.n_lanes, 1)
         for layer in range(num_layers):
             if layer >= hc_start:
                 si_attn = 2 * layer
-                w_post_init[si_attn, 1, 0] = 1.6  # HC attn wp1
+                si_mlp = 2 * layer + 1
+                w_post_init[si_attn, 1, 0] = 1.5  # HC attn wp1
+                w_post_init[si_mlp, 1, 0] = 1.5   # HC MLP wp1
         self.hyper_w_post = nn.Parameter(w_post_init)
         self.hyper_w_post.label = 'hyper_post'
 
