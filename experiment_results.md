@@ -1506,15 +1506,23 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 | 129 | 1.0 | 2.0(attn only) | 1.0 | 1.0 | 3.2809 | 1510 |
 | 130 | 1.0 | 1.5(attn only) | 1.0 | 1.0 | 3.2804 (hc_start=6) | 1510 |
 | **131** | **1.0** | **1.5(attn only)** | **1.0** | **1.0** | **3.2785** (hc_start=5) | **1510** |
-| 132 | 1.0 | 1.5(attn only) | 1.0 | 1.0 | *running* (hc_start=4) | 1510 |
+| 132 | 1.0 | 1.5(attn only) | 1.0 | 1.0 | 3.2809 (hc_start=4) | 1510 |
+| 133 | 1.0 | 1.5(attn only) | 1.0 | 1.0 | *running* (hc_start=5, repeat) | 1510 |
 
 **Exp 127/128 mean: 3.2806 ± 0.0011** (attn-only wp1=1.5, hc_start=7)
 
+**hc_start sweep:**
+| hc_start | val_loss | Memory |
+|----------|----------|--------|
+| 4 | 3.2809 | 34304 MiB |
+| **5** | **3.2785** | **34160 MiB** |
+| 6 | 3.2804 | 34016 MiB |
+| 7 | 3.2806 (mean) | 33944 MiB |
+
 **Key findings:**
 1. **HC expansion helps!** hc_start=5 (3.2785) > hc_start=6 (3.2804) ≈ hc_start=7 (3.2806)
-2. **Exp 131 (hc_start=5, attn wp1=1.5): 3.2785** — NEW BEST, approaching 3.278 target!
-3. **Best init: attn-only wp1=1.5, all else 1.0** — mild asymmetry for lane1 injection
-4. **Attn wp1=1.5 > 2.0 > 1.25**: sweet spot is 1.5 for HC attn asymmetry
-5. **MLP should stay at 1.0**: adding MLP wp1=1.5 slightly worse than attn-only
-6. **Uniform init scale**: 1.0 ≈ 1.5 > 2.0 >> 0.5
-7. **Memory**: hc_start=5 uses 34160 MiB (vs 33944 for hc_start=7) — still within budget
+2. **hc_start=4 is too early (3.2809)** — diminishing returns, more memory
+3. **Exp 131 (hc_start=5, attn wp1=1.5): 3.2785** — NEW BEST, approaching 3.278 target!
+4. **Best init: attn-only wp1=1.5, all else 1.0** — mild asymmetry for lane1 injection
+5. **Attn wp1=1.5 > 2.0 > 1.25**: sweet spot is 1.5 for HC attn asymmetry
+6. **MLP should stay at 1.0**: adding MLP wp1=1.5 slightly worse than attn-only
