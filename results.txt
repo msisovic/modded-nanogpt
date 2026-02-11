@@ -1,0 +1,166 @@
+steps = 1470, frac = 0.60 =============================================
+
+step:1510/1510 val_loss:3.2787 train_time:91487ms step_avg:60.59ms
+peak memory allocated: 31615 MiB reserved: 49200 MiB
+step:1510/1510 val_loss:3.2796 train_time:91421ms step_avg:60.54ms
+peak memory allocated: 31615 MiB reserved: 49200 MiB
+step:1510/1510 val_loss:3.2775 train_time:91517ms step_avg:60.61ms
+peak memory allocated: 31615 MiB reserved: 49160 MiB
+step:1510/1510 val_loss:3.2796 train_time:91443ms step_avg:60.56ms
+peak memory allocated: 31615 MiB reserved: 49200 MiB
+step:1510/1510 val_loss:3.2804 train_time:91427ms step_avg:60.55ms
+peak memory allocated: 30703 MiB reserved: 48440 MiB
+step:1510/1510 val_loss:3.2795 train_time:91677ms step_avg:60.71ms
+peak memory allocated: 31615 MiB reserved: 49200 MiB
+step:1510/1510 val_loss:3.2793 train_time:91576ms step_avg:60.65ms
+peak memory allocated: 31615 MiB reserved: 49200 MiB
+step:1510/1510 val_loss:3.2809 train_time:91587ms step_avg:60.65ms
+peak memory allocated: 31615 MiB reserved: 49200 MiB
+
+baseline =============================================================
+
+=== Run 1 ===
+step:1538/1555 train_time:90621ms step_avg:58.92ms
+step:1539/1555 train_time:90705ms step_avg:58.94ms
+step:1540/1555 train_time:90792ms step_avg:58.96ms
+step:1541/1555 train_time:90874ms step_avg:58.97ms
+step:1542/1555 train_time:90961ms step_avg:58.99ms
+step:1543/1555 train_time:91043ms step_avg:59.00ms
+step:1544/1555 train_time:91130ms step_avg:59.02ms
+step:1545/1555 train_time:91211ms step_avg:59.04ms
+step:1546/1555 train_time:91298ms step_avg:59.05ms
+step:1547/1555 train_time:91381ms step_avg:59.07ms
+step:1548/1555 train_time:91468ms step_avg:59.09ms
+step:1549/1555 train_time:91550ms step_avg:59.10ms
+step:1550/1555 train_time:91638ms step_avg:59.12ms
+step:1551/1555 train_time:91720ms step_avg:59.14ms
+step:1552/1555 train_time:91808ms step_avg:59.15ms
+step:1553/1555 train_time:91890ms step_avg:59.17ms
+step:1554/1555 train_time:91978ms step_avg:59.19ms
+step:1555/1555 train_time:92060ms step_avg:59.20ms
+step:1555/1555 val_loss:3.2789 train_time:92170ms step_avg:59.27ms
+peak memory allocated: 31587 MiB reserved: 46898 MiB
+=== Run 2 ===
+step:1538/1555 train_time:90821ms step_avg:59.05ms
+step:1539/1555 train_time:90904ms step_avg:59.07ms
+step:1540/1555 train_time:90991ms step_avg:59.09ms
+step:1541/1555 train_time:91073ms step_avg:59.10ms
+step:1542/1555 train_time:91161ms step_avg:59.12ms
+step:1543/1555 train_time:91243ms step_avg:59.13ms
+step:1544/1555 train_time:91330ms step_avg:59.15ms
+step:1545/1555 train_time:91411ms step_avg:59.17ms
+step:1546/1555 train_time:91498ms step_avg:59.18ms
+step:1547/1555 train_time:91580ms step_avg:59.20ms
+step:1548/1555 train_time:91668ms step_avg:59.22ms
+step:1549/1555 train_time:91751ms step_avg:59.23ms
+step:1550/1555 train_time:91838ms step_avg:59.25ms
+step:1551/1555 train_time:91920ms step_avg:59.27ms
+step:1552/1555 train_time:92008ms step_avg:59.28ms
+step:1553/1555 train_time:92090ms step_avg:59.30ms
+step:1554/1555 train_time:92177ms step_avg:59.32ms
+step:1555/1555 train_time:92258ms step_avg:59.33ms
+step:1555/1555 val_loss:3.2789 train_time:92370ms step_avg:59.40ms
+peak memory allocated: 31587 MiB reserved: 48038 MiB
+=== Run 3 ===
+step:1538/1555 train_time:90743ms step_avg:59.00ms
+step:1539/1555 train_time:90825ms step_avg:59.02ms
+step:1540/1555 train_time:90914ms step_avg:59.04ms
+step:1541/1555 train_time:90995ms step_avg:59.05ms
+step:1542/1555 train_time:91082ms step_avg:59.07ms
+step:1543/1555 train_time:91164ms step_avg:59.08ms
+step:1544/1555 train_timestep:1538/1555 train_time:90678ms step_avg:58.96ms
+step:1539/1555 train_time:90761ms step_avg:58.97ms
+step:1540/1555 train_time:90849ms step_avg:58.99ms
+step:1541/1555 train_time:90931ms step_avg:59.01ms
+step:1542/1555 train_time:91018ms step_avg:59.03ms
+step:1543/1555 train_time:91100ms step_avg:59.04ms
+step:1544/1555 train_time:91187ms step_avg:59.06ms
+step:1545/1555 train_time:91267ms step_avg:59.07ms
+step:1546/1555 train_time:91354ms step_avg:59.09ms
+step:1547/1555 train_time:91437ms step_avg:59.11ms
+step:1548/1555 train_time:91525ms step_avg:59.12ms
+step:1549/1555 train_time:91608ms step_avg:59.14ms
+step:1550/1555 train_time:91696ms step_avg:59.16ms
+stepstep:1538/1555 train_time:90726ms step_avg:58.99ms
+step:1539/1555 train_time:90809ms step_avg:59.01ms
+step:1540/1555 train_time:90898ms step_avg:59.02ms
+step:1541/1555 train_time:90979ms step_avg:59.04ms
+step:1542/1555 train_time:91067ms step_avg:59.06ms
+step:1543/1555 train_time:91150ms step_avg:59.07ms
+step:1544/1555 train_time:91236ms step_avg:59.09ms
+step:1545/1555 train_time:91317ms step_avg:59.10ms
+step:1546/1555 train_time:91404ms step_avg:59.12ms
+step:1547/1555 train_time:91486ms step_avg:59.14ms
+step:1548/1555 train_time:91574ms step_avg:59.16ms
+step:1549/1555 train_time:91657ms step_avg:59.17ms
+step:1550/1555 train_time:91745ms step_avg:59.19ms
+step:1551/1555 train_time:91828ms step_avg:59.21ms
+step:1552/1555 train_time:91916ms step_avg:59.22ms
+step:1553/1555 train_time:91996ms step_avg:59.24ms
+step:1554/1555 train_time:92083ms step_avg:59.26ms
+step:1555/1555 train_time:92166ms step_avg:59.27ms
+step:1555/1555 val_loss:3.2793 train_time:92276ms step_avg:59.34ms
+peak memory allocated: 31587 MiB reserved: 46738 MiB
+=== Run 6 ===
+step:1538/1555 train_time:90833ms step_avg:59.06ms
+step:1539/1555 train_time:90915ms step_avg:59.07ms
+step:1540/1555 train_time:91003ms step_avg:59.09ms
+step:1541/1555 train_time:91085ms step_avg:59.11ms
+step:1542/1555 train_time:91172ms step_avg:59.13ms
+step:1543/1555 train_time:91255ms step_avg:59.14ms
+step:1544/1555 train_time:91341ms step_avg:59.16ms
+step:1545/1555 train_time:91423ms step_avg:59.17ms
+step:1546/1555 train_time:91510ms step_avg:59.19ms
+step:1547/1555 train_time:91591ms step_avg:59.21ms
+step:1548/1555 train_time:91680ms step_avg:59.22ms
+step:1549/1555 train_time:91762ms step_avg:59.24ms
+step:1550/1555 train_time:91849ms step_avg:59.26ms
+step:1551/1555 train_time:91932ms step_avg:59.27ms
+step:1552/1555 train_time:92021ms step_avg:59.29ms
+step:1553/1555 train_time:92102ms step_avg:59.31ms
+step:1554/1555 train_time:92189ms step_avg:59.32ms
+step:1555/1555 train_time:92271ms step_avg:59.34ms
+step:1555/1555 val_loss:3.2813 train_time:92381ms step_avg:59.41ms
+peak memory allocated: 31587 MiB reserved: 46738 MiB
+=== Run 7 ===
+step:1538/1555 train_time:90652ms step_avg:58.94ms
+step:1539/1555 train_time:90734ms step_avg:58.96ms
+step:1540/1555 train_time:90822ms step_avg:58.98ms
+step:1541/1555 train_time:90902ms step_avg:58.99ms
+step:1542/1555 train_time:90990ms step_avg:59.01ms
+step:1543/1555 train_time:91073ms step_avg:59.02ms
+step:1544/1555 train_time:91160ms step_avg:59.04ms
+step:1545/1555 train_time:91241ms step_avg:59.06ms
+step:1546/1555 train_time:91328ms step_avg:59.07ms
+step:1547/1555 train_time:91410ms step_avg:59.09ms
+step:1548/1555 train_time:91498ms step_avg:59.11ms
+step:1549/1555 train_time:91580ms step_avg:59.12ms
+step:1550/1555 train_time:91668ms step_avg:59.14ms
+step:1551/1555 train_time:91751ms step_avg:59.16ms
+step:1552/1555 train_time:91839ms step_avg:59.17ms
+step:1553/1555 train_time:91920ms step_avg:59.19ms
+step:1554/1555 train_time:92007ms step_avg:59.21ms
+step:1555/1555 train_time:92089ms step_avg:59.22ms
+step:1555/1555 val_loss:3.2806 train_time:92200ms step_avg:59.29ms
+peak memory allocated: 31587 MiB reserved: 46898 MiB
+=== Run 8 ===
+step:1538/1555 train_time:90746ms step_avg:59.00ms
+step:1539/1555 train_time:90828ms step_avg:59.02ms
+step:1540/1555 train_time:90916ms step_avg:59.04ms
+step:1541/1555 train_time:90999ms step_avg:59.05ms
+step:1542/1555 train_time:91086ms step_avg:59.07ms
+step:1543/1555 train_time:91168ms step_avg:59.08ms
+step:1544/1555 train_time:91254ms step_avg:59.10ms
+step:1545/1555 train_time:91336ms step_avg:59.12ms
+step:1546/1555 train_time:91423ms step_avg:59.14ms
+step:1547/1555 train_time:91505ms step_avg:59.15ms
+step:1548/1555 train_time:91593ms step_avg:59.17ms
+step:1549/1555 train_time:91675ms step_avg:59.18ms
+step:1550/1555 train_time:91763ms step_avg:59.20ms
+step:1551/1555 train_time:91844ms step_avg:59.22ms
+step:1552/1555 train_time:91932ms step_avg:59.23ms
+step:1553/1555 train_time:92013ms step_avg:59.25ms
+step:1554/1555 train_time:92100ms step_avg:59.27ms
+step:1555/1555 train_time:92182ms step_avg:59.28ms
+step:1555/1555 val_loss:3.2788 train_time:92292ms step_avg:59.35ms
+peak memory allocated: 31587 MiB reserved: 48038 MiB

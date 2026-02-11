@@ -1185,7 +1185,7 @@ class GPT(nn.Module):
         skip_out = [6] # no attn op on layer 6
         x_backout = None
         backout_layer = 7
-        hc_start = 5  # layer where we introduce lane1 (single-stream before this)
+        hc_start = 7  # layer where we introduce lane1 (single-stream before this)
 
         # set lambdas (updated layout after removing resid/x0/bigram lambdas)
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
@@ -1490,7 +1490,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1475  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1470  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1577,7 +1577,7 @@ TRAINING_STAGES = [
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
-training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
+training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
 
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
