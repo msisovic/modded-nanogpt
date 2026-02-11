@@ -1493,7 +1493,10 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 | 116 | 1.0 | 2.0 | 0.25 | 0.5 | 3.2829 | 1510 |
 | 117 | 1.0 | ramped 2→3 | 0.5 | 0.5 | 3.2824 | 1510 |
 | 118 | 1.0 | 1.0 | 1.0 | 1.0 | 3.2804 | 1510 |
-| 119 | 1.0 | 2.5 | 0.5 | 0.75 | *running* | 1510 |
+| 119 | 1.0 | 2.5 | 0.5 | 0.75 | 3.2815 | 1510 |
+| 120 | 1.0 | 1.0 | 0.5 | 1.0 | 3.2811 | 1510 |
+| 121 | 1.5 | 1.5 | 1.5 | 1.5 | 3.2806 | 1510 |
+| 122 | 0.5 | 0.5 | 0.5 | 0.5 | *running* | 1510 |
 
 **Key findings:**
 1. **Attn wp1 → 2.0 init helped** (allowed 5-step reduction while maintaining loss)
@@ -1505,4 +1508,6 @@ MLP weights trend downward, so keep init at 0.5 to preserve optimizer dynamics.
 7. **MLP wp0=0.25 didn't help** (Exp 116: 3.2829) — MLP needs 0.5 headroom
 8. **All-1.0 init (Exp 118: 3.2804)** still competitive — differentiated init may not be reliably better
 9. **Ramped wp1 (Exp 117: 3.2824)** — no benefit from layer-specific attn wp1
+10. **Uniform 1.5 (Exp 121: 3.2806)** — nearly tied with 1.0, uniform init is robust
+11. **All-1.0 + MLP wp0=0.5 (Exp 120: 3.2811)** — targeted MLP change didn't improve over pure 1.0
 6. **Exp 114: wp0=0.5 caused L7 attn wp0 to go negative (-0.41)** — too low init destabilizes early HC layers
