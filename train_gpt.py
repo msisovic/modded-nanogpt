@@ -2042,4 +2042,56 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+
+# -----------------------------------------------------------------------------
+# POST-TRAINING ANALYSIS: Hyper-Connection Fingerprints
+# -----------------------------------------------------------------------------
+if master_process:
+    print0("\n" + "="*80, console=True)
+    print0("HYPER-CONNECTION MATRIX ANALYSIS", console=True)
+    print0("="*80, console=True)
+
+    with torch.no_grad():
+        num_layers = model.num_layers
+        parallel_start = model.parallel_start
+        n_sub = 2 * num_layers
+        n_parallel_sub = 2 * (num_layers - parallel_start)
+
+        w_post_raw = model.w_post.float().cpu()
+        w_post0 = w_post_raw[:n_sub]             # (n_sublayers,)
+        w_post1 = w_post_raw[n_sub:]             # (n_parallel_sublayers,)
+        x0_lambda = model.x0_lambda.float().cpu()       # (num_layers,)
+        bigram_lambda = model.bigram_lambda.float().cpu() # (num_layers,)
+        resid_lambda = model.resid_lambda.float().cpu()   # (n_sublayers,)
+
+        # Report resid_lambda
+        print0(f"\n[resid_lambda] All sublayers: {resid_lambda.numpy()}", console=True)
+        cumulative_gain = resid_lambda.prod().item()
+        print0(f"[resid_lambda] Cumulative gain: {cumulative_gain:.4f}", console=True)
+
+        torch.set_printoptions(precision=4, sci_mode=False, linewidth=160)
+
+        # Full per-layer summary
+        print0(f"\n{'Layer':>5} {'Type':>4} {'si':>3} {'rl':>7} {'wp0':>7} {'wp1':>7} {'|diff|':>7} {'x0_l':>7} {'bg_l':>7}", console=True)
+        print0("-" * 65, console=True)
+        for layer in range(num_layers):
+            for sub, stype in [(0, 'attn'), (1, 'mlp')]:
+                si = 2 * layer + sub
+                rl_val = resid_lambda[si].item()
+                wp0_val = w_post0[si].item()
+                # w_post1 only exists for layers >= parallel_start
+                if layer >= parallel_start:
+                    wp1_idx = si - 2 * parallel_start
+                    wp1_val = w_post1[wp1_idx].item()
+                else:
+                    wp1_val = float('nan')
+                diff = abs(wp0_val - wp1_val) if not math.isnan(wp1_val) else float('nan')
+                xb_val = x0_lambda[layer].item()
+                bb_val = bigram_lambda[layer].item()
+                wp1_str = f"{wp1_val:>7.4f}" if not math.isnan(wp1_val) else "    n/a"
+                diff_str = f"{diff:>7.4f}" if not math.isnan(diff) else "    n/a"
+                print0(f"{layer:>5} {stype:>4} {si:>3} {rl_val:>7.4f} {wp0_val:>7.4f} {wp1_str} {diff_str} {xb_val:>7.4f} {bb_val:>7.4f}", console=True)
+
+    print0("="*80 + "\n", console=True)
+
 dist.destroy_process_group()
