@@ -1114,12 +1114,21 @@ class Block(nn.Module):
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP() if has_mlp else None
 
-    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor = None, c_fc: Tensor = None, c_proj: Tensor = None):
+    def forward(self, lane0, lane1, attn_args, qkvo_w, c_fc, c_proj,
+                skip_bias, resid_lambda_attn, resid_lambda_mlp,
+                w_post_attn, w_post_mlp):
         if self.attn is not None:
-            x = x + self.attn(norm(x), attn_args, qkvo_w)
+            layer_out = self.attn(norm(lane0), attn_args, qkvo_w) + skip_bias
+            lane0 = resid_lambda_attn * lane0 + layer_out * w_post_attn[0]
+            if lane1 is not None:
+                lane1 = resid_lambda_attn * lane1 + layer_out * w_post_attn[1]
         if self.mlp is not None:
-            x = x + self.mlp(norm(x), c_fc, c_proj)
-        return x
+            mlp_input = lane1 if lane1 is not None else lane0
+            layer_out = self.mlp(norm(mlp_input), c_fc, c_proj)
+            lane0 = resid_lambda_mlp * lane0 + layer_out * w_post_mlp[0]
+            if lane1 is not None:
+                lane1 = resid_lambda_mlp * lane1 + layer_out * w_post_mlp[1]
+        return lane0, lane1
 
 # -----------------------------------------------------------------------------
 # The main model
@@ -1236,18 +1245,19 @@ class GPT(nn.Module):
 
         # Parallel-connections: 2-lane residual stream (attn reads lane0, MLP reads lane1)
         self.parallel_start = 7
-        w_post_init = torch.ones(n_sublayers, 2, 1)
-        for layer in range(num_layers):
-            if layer >= self.parallel_start:
-                si_attn = 2 * layer
-                w_post_init[si_attn, 1, 0] = 1.5  # attn w_post1
+        n_parallel_sublayers = 2 * (num_layers - self.parallel_start)  # 8
+        w_post_init = torch.cat([
+            torch.ones(n_sublayers),            # w_post0: 22 values (all sublayers)
+            torch.ones(n_parallel_sublayers),   # w_post1: 8 values (parallel sublayers)
+        ])
+        w_post_init[n_sublayers::2] = 1.5      # attn w_post1 values get 1.5
         self.w_post = nn.Parameter(w_post_init)
         self.w_post.label = 'w_post'
 
-        self.x0_lambda = nn.Parameter(torch.zeros(n_sublayers))
+        self.x0_lambda = nn.Parameter(torch.zeros(num_layers))
         self.x0_lambda.label = 'x0_lambda'
 
-        self.bigram_lambda = nn.Parameter(0.05 * torch.ones(n_sublayers))
+        self.bigram_lambda = nn.Parameter(0.05 * torch.ones(num_layers))
         self.bigram_lambda.label = 'bigram_lambda'
 
         self.resid_lambda = nn.Parameter(1.1**0.5 * torch.ones(n_sublayers))
@@ -1288,8 +1298,9 @@ class GPT(nn.Module):
         skip_lambda = self.scalars[2 * self.num_layers + 2]
 
         # Unbind scalars per-sublayer per-lane (avoids select_backwards kernel)
-        w_post0 = self.w_post[:, 0, 0].bfloat16().unbind(0)
-        w_post1 = self.w_post[:, 1, 0].bfloat16().unbind(0)
+        n_sub = 2 * self.num_layers
+        w_post0 = self.w_post[:n_sub].bfloat16().unbind(0)    # 22 scalars
+        w_post1 = self.w_post[n_sub:].bfloat16().unbind(0)    # 8 scalars
         x0_lambda = self.x0_lambda.bfloat16().unbind(0)
         bigram_lambda = self.bigram_lambda.bfloat16().unbind(0)
         resid_lambda = self.resid_lambda.bfloat16().unbind(0)
@@ -1324,7 +1335,7 @@ class GPT(nn.Module):
         bigram_lambda = (zero,) + bigram_lambda[1:]
 
         # Precompute skip contributions outside loop 
-        skip_bias = tuple(x0 * x0_lambda[2*i] + x0_bigram * bigram_lambda[2*i] for i in range(self.num_layers))
+        skip_bias = tuple(x0 * x0_lambda[i] + x0_bigram * bigram_lambda[i] for i in range(self.num_layers))
 
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
@@ -1355,10 +1366,6 @@ class GPT(nn.Module):
             c_fc = mlp_fcs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
             c_proj = mlp_projs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
 
-            block = self.blocks[i]
-            si = 2 * i  # sublayer index for attn
-
-            # Introduce lane1 at parallel_start by copying lane0
             if i == self.parallel_start:
                 lane1 = lane0
 
@@ -1369,30 +1376,19 @@ class GPT(nn.Module):
                 if lane1 is not None:
                     lane1 = lane1 + skip_gate_out * skip_val
 
-            if i < self.parallel_start:
-                # Single-stream: only lane0, MLP also reads lane0
-                if block.attn is not None:
-                    layer_out = block.attn(norm(lane0), attn_args, qkvo_w)
-                    layer_out = layer_out + skip_bias[i]
-                    lane0 = resid_lambda[si] * lane0 + layer_out * w_post0[si]
-                if i in skip_in:
-                    skip_connections.append(lane0)
-                if block.mlp is not None:
-                    layer_out = block.mlp(norm(lane0), c_fc, c_proj)
-                    lane0 = resid_lambda[si+1] * lane0 + layer_out * w_post0[si+1]
-            else:
-                # Full 2-lane parallel connections
-                if block.attn is not None:
-                    layer_out = block.attn(norm(lane0), attn_args, qkvo_w)
-                    layer_out = layer_out + skip_bias[i]
-                    lane0 = resid_lambda[si] * lane0 + layer_out * w_post0[si]
-                    lane1 = resid_lambda[si] * lane1 + layer_out * w_post1[si]
-                if i in skip_in:
-                    skip_connections.append(lane0)
-                if block.mlp is not None:
-                    layer_out = block.mlp(norm(lane1), c_fc, c_proj)
-                    lane0 = resid_lambda[si+1] * lane0 + layer_out * w_post0[si+1]
-                    lane1 = resid_lambda[si+1] * lane1 + layer_out * w_post1[si+1]
+            si = 2 * i
+
+            lane0, lane1 = self.blocks[i](
+                lane0, lane1, attn_args, qkvo_w, c_fc, c_proj,
+                skip_bias=skip_bias[i],
+                resid_lambda_attn=resid_lambda[si],
+                resid_lambda_mlp=resid_lambda[si+1],
+                w_post_attn=(w_post0[si], w_post1[si - 2*self.parallel_start] if i >= self.parallel_start else None),
+                w_post_mlp=(w_post0[si+1], w_post1[si+1 - 2*self.parallel_start] if i >= self.parallel_start else None),
+            )
+
+            if i in skip_in:
+                skip_connections.append(lane0)
             if i == backout_layer:
                 x_backout = lane0
 
