@@ -155,6 +155,25 @@ def setup_context_t(ctx: torch.autograd.function.FunctionCtx, inputs, output):
 mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 
 # -----------------------------------------------------------------------------
+# FP8 pre-quantized MLP weights for Triton kernel
+
+_FP8_ACT_SCALE = 16.0 / torch.finfo(torch.float8_e4m3fn).max  # ~0.036
+
+def quantize_weights_fp8(model):
+    """Pre-quantize MLP weight bank to FP8 for use in linear_relu_square Triton kernel."""
+    E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+    with torch.no_grad():
+        if model._mlp_bank_f8 is None:
+            model._mlp_bank_f8 = torch.zeros_like(model.mlp_bank, dtype=torch.float8_e4m3fn)
+            model._mlp_bank_scales = torch.ones(24, dtype=torch.float32, device=model.mlp_bank.device)
+        # Vectorized: compute all 24 scales and quantize in bulk
+        flat = model.mlp_bank.view(24, -1)
+        scales = flat.abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
+        # Pre-multiply with act_scale so the kernel gets a single concrete float
+        model._mlp_bank_scales[:] = (scales * _FP8_ACT_SCALE).float()
+        model._mlp_bank_f8[:] = (model.mlp_bank / scales.view(12, 2, 1, 1)).to(torch.float8_e4m3fn)
+
+# -----------------------------------------------------------------------------
 # Polar Express
 
 # Computed for num_iters=5, safety_factor=2e-2, cushion=2
@@ -1212,6 +1231,9 @@ class GPT(nn.Module):
         # Transposed weight storage for faster gradient accumulation
         self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
 
+        self._mlp_bank_f8 = None
+        self._mlp_bank_scales = None
+
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
 
         self.embed = nn.Embedding(self.vocab_size, model_dim)
@@ -1293,6 +1315,12 @@ class GPT(nn.Module):
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
+        # FP8 pre-quantized weights for Triton kernel (no _scaled_mm, no fusion breakage)
+        use_mlp_fp8 = self.training and self._mlp_bank_f8 is not None and not os.environ.get("DISABLE_MLP_FP8")
+        if use_mlp_fp8:
+            mlp_f8_all = self._mlp_bank_f8.flatten(0, 1).unbind(0)
+            mlp_fc_f8 = mlp_f8_all[0::2]
+            mlp_fc_scales = [self._mlp_bank_scales[i*2].item() for i in range(12)]
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
@@ -1337,6 +1365,8 @@ class GPT(nn.Module):
             qkvo_w = attn_weights[i - (i > 6)] if i != 6 else None
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
+            if use_mlp_fp8:
+                fc_f8, fc_s = mlp_fc_f8[i], mlp_fc_scales[i]
 
             # Introduce lane1 at parallel_start by copying lane0
             if i == self.parallel_start:
@@ -1355,23 +1385,24 @@ class GPT(nn.Module):
 
             # Dispatch based on layer type
             post_attn = None
+            mlp_args = (c_fc, c_proj, fc_f8, fc_s) if use_mlp_fp8 else (c_fc, c_proj)
             if i == 6:
                 # MLP-only layer (no attention) @YouJiacheng
                 post_attn = lane0
-                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), *mlp_args)
             elif i < self.parallel_start:
                 # Single-stream: attn and mlp both read/write lane0
                 attn_out = attn(norm(lane0), attn_args, qkvo_w)
                 lane0 = resid_lambdas_attn[i] * lane0 + attn_out + x0_inject[i]
                 post_attn = lane0
-                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), *mlp_args)
             else:
                 # Parallel: attn reads lane0, mlp reads lane1, both write to both lanes
                 attn_out = attn(norm(lane0), attn_args, qkvo_w)
                 lane0 = resid_lambdas_attn[i] * lane0 + post_lambdas_attn_ln0[i] * attn_out + x0_inject[i]
                 lane1 = resid_lambdas_attn[i] * lane1 + post_lambdas_attn_ln1[i] * attn_out
                 post_attn = lane0
-                mlp_out = ReLUSqrdMLP(norm(lane1), c_fc, c_proj)
+                mlp_out = ReLUSqrdMLP(norm(lane1), *mlp_args)
                 lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * mlp_out
                 lane1 = resid_lambdas_mlp[i] * lane1 + post_lambdas_mlp_ln1[i] * mlp_out
 
@@ -1929,6 +1960,7 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
+quantize_weights_fp8(model)
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
@@ -1963,11 +1995,13 @@ for step in warmup_steps:
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    quantize_weights_fp8(model._orig_mod)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
 del val_loader, train_loader, initial_state
+quantize_weights_fp8(model._orig_mod)
 model.train()
 
 ########################################
@@ -2028,6 +2062,7 @@ for step in range(train_steps + 1):
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    quantize_weights_fp8(model._orig_mod)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
