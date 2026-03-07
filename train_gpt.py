@@ -158,6 +158,7 @@ mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 # FP8 pre-quantized MLP weights for Triton kernel
 
 _FP8_ACT_SCALE = 16.0 / torch.finfo(torch.float8_e4m3fn).max  # ~0.036
+_FP8_ACT_SCALE_INV = 1.0 / _FP8_ACT_SCALE  # ~28.0
 
 def quantize_weights_fp8(model):
     """Pre-quantize MLP weight bank to FP8 for use in linear_relu_square Triton kernel."""
@@ -1385,24 +1386,29 @@ class GPT(nn.Module):
 
             # Dispatch based on layer type
             post_attn = None
-            mlp_args = (c_fc, c_proj, fc_f8, fc_s) if use_mlp_fp8 else (c_fc, c_proj)
             if i == 6:
                 # MLP-only layer (no attention) @YouJiacheng
                 post_attn = lane0
-                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), *mlp_args)
+                normed = norm(lane0)
+                mlp_args = (c_fc, c_proj, fc_f8, fc_s, (normed * _FP8_ACT_SCALE_INV).to(torch.float8_e4m3fn)) if use_mlp_fp8 else (c_fc, c_proj)
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(normed, *mlp_args)
             elif i < self.parallel_start:
                 # Single-stream: attn and mlp both read/write lane0
                 attn_out = attn(norm(lane0), attn_args, qkvo_w)
                 lane0 = resid_lambdas_attn[i] * lane0 + attn_out + x0_inject[i]
                 post_attn = lane0
-                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), *mlp_args)
+                normed = norm(lane0)
+                mlp_args = (c_fc, c_proj, fc_f8, fc_s, (normed * _FP8_ACT_SCALE_INV).to(torch.float8_e4m3fn)) if use_mlp_fp8 else (c_fc, c_proj)
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(normed, *mlp_args)
             else:
                 # Parallel: attn reads lane0, mlp reads lane1, both write to both lanes
                 attn_out = attn(norm(lane0), attn_args, qkvo_w)
                 lane0 = resid_lambdas_attn[i] * lane0 + post_lambdas_attn_ln0[i] * attn_out + x0_inject[i]
                 lane1 = resid_lambdas_attn[i] * lane1 + post_lambdas_attn_ln1[i] * attn_out
                 post_attn = lane0
-                mlp_out = ReLUSqrdMLP(norm(lane1), *mlp_args)
+                normed = norm(lane1)
+                mlp_args = (c_fc, c_proj, fc_f8, fc_s, (normed * _FP8_ACT_SCALE_INV).to(torch.float8_e4m3fn)) if use_mlp_fp8 else (c_fc, c_proj)
+                mlp_out = ReLUSqrdMLP(normed, *mlp_args)
                 lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * mlp_out
                 lane1 = resid_lambdas_mlp[i] * lane1 + post_lambdas_mlp_ln1[i] * mlp_out
 
