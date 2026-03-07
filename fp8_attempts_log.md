@@ -390,3 +390,24 @@ FP8_SKIP_LAST=1 bash run.sh
 ```
 
 The `FP8_SKIP_LAST` env var controls how many of the last 12 MLP layers stay in BF16 (default=0, meaning all layers use FP8). Without it, the code runs attempt 4f (all layers FP8, current scaling).
+
+### Attempt 4i: Variance study — all 12 layers, current scaling (no skip)
+
+Testing whether the 4f→4g convergence gap is real or run-to-run variance. Running 4 trials of all-12-layers current scaling (FP8_SKIP_LAST=0):
+
+| Trial | val_loss | step_avg (ms) | Notes |
+|-------|----------|---------------|-------|
+| 1 (original 4f) | 3.2810 | 476.63 | First run |
+| 2 | 3.2784 | 476.48 | Under 3.279! |
+| 3 | 3.2805 | 472.96 | |
+| 4 | 3.2796 | 472.15 | |
+
+**Mean val_loss: 3.2799** (std ~0.0011, range 3.2784–3.2810)
+**Mean step_avg: 474.56ms** (6.5ms/step faster than baseline 482.09ms, ~1.6% speedup)
+
+**Conclusion:** The all-12-layers current scaling val_loss is **right at baseline** (3.2799 vs 3.2794). The gap is within run-to-run variance (~±0.001). 2 of 4 runs were under 3.28, 1 was under 3.279. Skipping the last layer is NOT necessary for convergence — the earlier gap was just noise.
+
+**Recommended config: all 12 layers FP8, current scaling, no layer skipping.**
+```bash
+bash run.sh   # FP8_SKIP_LAST defaults to 0
+```
