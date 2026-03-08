@@ -411,3 +411,71 @@ Testing whether the 4f→4g convergence gap is real or run-to-run variance. Runn
 ```bash
 bash run.sh   # FP8_SKIP_LAST defaults to 0
 ```
+
+---
+
+## Attempt 5: No activation scaling + W2 FP8
+
+### Key insight
+Re-measured baseline and found that activation scaling overhead (amax + scale + cast) was eating all FP8 compute gains. Removed activation scaling entirely — just raw `.to(fp8)` cast on RMSNorm outputs. This works because RMSNorm outputs have amax ~5-6, well within FP8 E4M3 range (±448).
+
+### Attempt 5a: W1-only FP8, no activation scaling
+- Removed `amax = normed.detach().abs().max().clamp(min=1e-12)` (expensive reduction)
+- Removed `x_f8 = (normed.detach() * (448.0 / amax)).to(fp8)` (scale + cast)
+- Replaced with `x_f8 = normed.detach().to(torch.float8_e4m3fn)` (raw cast)
+- Pass pure weight scale `fc_s` instead of combined scale `_fp8_scale_buf`
+- Weight scaling in `quantize_weights_fp8` retained (weights CAN exceed ±448, OOM without it)
+- **Result: 232ms/step phase 1, val_loss=3.2798** — convergence fine, ~5ms faster than 237ms baseline in phase 1
+- Overall avg 435ms due to torch.compile phase degradation (same issue as attempt 4f)
+
+### Attempt 5b: W1+W2 FP8, separate cast on post
+- Added `fp8_matmul` Triton kernel for `post @ W2` with FP8 tensor cores
+- Pre-quantize W2 (c_proj) to FP8 in `quantize_weights_fp8`, stored transposed as (768, 3072)
+- Cast `post` to FP8 via separate `.to(fp8)` kernel before W2 FP8 matmul
+- **Microbenchmark:**
+
+| Operation | BF16 (ms) | FP8 (ms) | Notes |
+|-----------|-----------|----------|-------|
+| W2 matmul only (16384×3072 @ 3072×768) | 0.101 | 0.081 | 20% faster |
+| W2 cast + matmul | — | 0.117 | Cast adds 0.036ms, net 16% SLOWER |
+| W1+W2 combined | 0.209 | 0.229 | Separate cast kills the gain |
+
+- **Full training: 233ms/step phase 1, val_loss=4.52→5.98** — cast overhead eats the speedup, convergence terrible from double FP8 quantization
+
+### Attempt 5c: W1+W2 FP8, fused FP8 cast in W1 kernel
+- Fused the `post.to(fp8)` cast into the `linear_relu_square_kernel` output path
+- Kernel writes FP8 `post` alongside BF16 `post` — data already in registers, just an extra TMA store
+- **Problem:** Extra TMA descriptor pushes shared memory from 232KB → 246KB (H100 limit: 232KB)
+- **Fix:** Reduce `num_stages` from 4 → 3 (fewer pipeline stages = less shared memory)
+- Pointer stores (instead of TMA) also exceeded shared memory limit — Triton buffers all stores
+
+**Microbenchmark (fused, stages=3):**
+
+| Component | Time (ms) |
+|-----------|-----------|
+| W1 kernel (stages=4, no FP8 aux) | 0.119 |
+| W1 kernel (stages=3, +FP8 aux write) | 0.136 (+0.017) |
+| W2 BF16 matmul | 0.090 |
+| W2 FP8 matmul | 0.070 (-0.020) |
+| **W1+W2 BF16 (baseline)** | **0.209** |
+| **W1+W2 FP8 (fused)** | **0.206** (-0.003) |
+
+- `num_stages` 4→3 costs 0.017ms on W1 kernel, FP8 W2 saves 0.020ms — net 0.003ms/call
+- **Full training: 221ms/step phase 1** — 11ms faster than W1-only (232ms)
+  - Discrepancy vs microbenchmark: compiled graph benefits from smaller FP8 W2 weights (half memory), better cache
+- **val_loss=nan at step 250** — convergence failed
+  - Raw FP8 cast on `post = relu(pre)^2` loses too much precision for W2 matmul
+  - Post values are non-negative, amax ~15-60 during training, within FP8 range but 3 mantissa bits is insufficient
+  - Fixed scaling (post * 7.0 before FP8 cast, undo in combined W2 scale) also gave nan — scale math was correct but `num_stages=3` subtly changes W1 numerics which compounds
+
+### Why W2 FP8 doesn't work (root cause)
+1. **The W2 matmul is too small for FP8 to help.** At (16384, 3072) @ (3072, 768), BF16 cuBLAS does it in 0.1ms. FP8 saves 0.02ms but any overhead (cast, scale, extra kernel) eats the gain.
+2. **The FP8 cast on `post` is the bottleneck.** Reading 96MB of BF16, writing 48MB of FP8 = 0.036ms per call. Even fusing into the W1 kernel requires `num_stages=3` which costs 0.017ms.
+3. **Double FP8 quantization destroys convergence.** Both x→FP8 for W1 and post→FP8 for W2 are unscaled. The accumulated quantization noise from two FP8 matmuls per layer × 12 layers is too much.
+4. **The `post @ W2` matmul can't benefit from BLOCK_K=128** in the same way as W1. W1 has K=768 (6 tiles at BLOCK_K=128). W2 has K=3072 (24 tiles at BLOCK_K=128). The BLOCK_K advantage is proportionally smaller for W2 since it already has more K-tiles to amortize overhead.
+
+### Current state (reverted to W1-only FP8, no activation scaling)
+- W1 FP8 with no activation scaling: ~232ms/step phase 1, val_loss=3.2798
+- Weight scaling retained in `quantize_weights_fp8` (0.4ms/step, amortized)
+- `fp8_matmul` kernel and fused FP8 aux infrastructure left in codebase but unused
+- W2 stays BF16
