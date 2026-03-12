@@ -401,8 +401,11 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
 
 @triton.jit
 def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
+                                 aux_raw_ptr,
                                  M, N, K, w_scale, w_scale_ptr,
                                  amax_ptr,
+                                 post_scale_inv_ptr,
+                                 post_amax_ptr,
                                  BLOCK_SIZE_M: tl.constexpr,
                                  BLOCK_SIZE_N: tl.constexpr,
                                  BLOCK_SIZE_K: tl.constexpr,
@@ -412,6 +415,8 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                                  USE_FP8: tl.constexpr,
                                  TRACK_AMAX: tl.constexpr,
                                  USE_SCALE_PTR: tl.constexpr,
+                                 USE_FP8_POST: tl.constexpr,
+                                 TRACK_POST_AMAX: tl.constexpr,
                                  ):
     dtype = tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -425,6 +430,8 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
 
     if USE_SCALE_PTR:
         w_scale = tl.load(w_scale_ptr)
+    if USE_FP8_POST:
+        post_scale_inv = tl.load(post_scale_inv_ptr)
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
         pid_m = tile_id // num_pid_n
@@ -459,29 +466,47 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
         acc = tl.permute(acc, (0, 2, 1))
         acc0, acc1 = tl.split(acc)
 
+        # Process c0 fully before c1: keeps only one post tile live at a time,
+        # reducing peak register pressure enough to allow num_stages=4 with USE_FP8_POST.
         c0 = acc0.to(dtype)
         if not FORWARD:
             c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
             c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
-
         c_desc.store([offs_am_c, offs_bn_c], c0)
-
         if FORWARD:
             c0_post = tl.maximum(c0, 0)
             c0_post = c0_post * c0_post
-            aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+            if TRACK_POST_AMAX:
+                c0_amax = tl.max(tl.abs(c0_post)).to(tl.float32)
+            if USE_FP8_POST:
+                # Direct register→gmem store avoids TMA staging SMEM, saving ~13KB.
+                # This lets us keep BLOCK_K=128 and num_stages=4 without SMEM overflow.
+                m_range = offs_am_c + tl.arange(0, BLOCK_SIZE_M)
+                n_range = offs_bn_c + tl.arange(0, BLOCK_SIZE_N // 2)
+                tl.store(aux_raw_ptr + m_range[:, None] * N + n_range[None, :],
+                         (c0_post * post_scale_inv.to(c0_post.dtype)).to(tl.float8e4nv))
+            else:
+                aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+            # c0_post freed here — acc1 / c1_post will reuse those registers
 
         c1 = acc1.to(dtype)
         if not FORWARD:
             c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
             c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
-
         c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
-
         if FORWARD:
             c1_post = tl.maximum(c1, 0)
             c1_post = c1_post * c1_post
-            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
+            if TRACK_POST_AMAX:
+                c1_amax = tl.max(tl.abs(c1_post)).to(tl.float32)
+                tl.atomic_max(post_amax_ptr, tl.maximum(c0_amax, c1_amax))
+            if USE_FP8_POST:
+                m_range = offs_am_c + tl.arange(0, BLOCK_SIZE_M)
+                n_range = offs_bn_c + BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
+                tl.store(aux_raw_ptr + m_range[:, None] * N + n_range[None, :],
+                         (c1_post * post_scale_inv.to(c1_post.dtype)).to(tl.float8e4nv))
+            else:
+                aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 
 _dummy_f32 = None  # lazily initialized 1-element tensor for unused pointer args
@@ -492,7 +517,8 @@ def _get_dummy_f32(device):
         _dummy_f32 = torch.zeros(1, dtype=torch.float32, device=device)
     return _dummy_f32
 
-def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0, w_scale_ptr=None, amax_out=None):
+def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0, w_scale_ptr=None, amax_out=None,
+                       use_fp8_post=False, post_scale_inv_ptr=None, post_amax_out=None):
     M, K = a.shape
     N = b.shape[0] if b is not None else b_f8.shape[0]
     dtype = torch.bfloat16
@@ -505,10 +531,13 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0, w_scal
     FORWARD = False
     if aux is None:
         FORWARD = True
-        aux = torch.empty((M, N), device=a.device, dtype=dtype)
+        aux_dtype = torch.float8_e4m3fn if use_fp8_post else dtype
+        aux = torch.empty((M, N), device=a.device, dtype=aux_dtype)
 
     if track_amax:
         amax_out.zero_()
+
+    track_post_amax = post_amax_out is not None
 
     # Triton needs valid pointers even for unused args
     dummy = _get_dummy_f32(a.device)
@@ -516,13 +545,17 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0, w_scal
         w_scale_ptr = dummy
     if amax_out is None:
         amax_out = dummy
+    if post_amax_out is None:
+        post_amax_out = dummy
+    if post_scale_inv_ptr is None:
+        post_scale_inv_ptr = dummy
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
     BLOCK_SIZE_K = 128 if use_fp8 else 64
-    num_stages = 4 if FORWARD else 3
+    num_stages = 3 if (not FORWARD or use_fp8_post) else 4
     num_warps = 8
 
     a_actual = a_f8 if use_fp8 else a
@@ -540,8 +573,11 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0, w_scal
 
     linear_relu_square_kernel[grid](
         a_desc, b_desc, c_desc, aux_desc,
+        aux,
         M, N, K, w_scale, w_scale_ptr,
         amax_out,
+        post_scale_inv_ptr,
+        post_amax_out,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -551,6 +587,8 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0, w_scal
         USE_FP8=use_fp8,
         TRACK_AMAX=track_amax,
         USE_SCALE_PTR=use_scale_ptr,
+        USE_FP8_POST=use_fp8_post,
+        TRACK_POST_AMAX=track_post_amax,
         num_stages=num_stages,
         num_warps=num_warps
     )
@@ -581,6 +619,28 @@ def scale_cast_fp8(x: torch.Tensor) -> torch.Tensor:
     _scale_cast_fp8_kernel[grid](x, out, _FP8_ACT_SCALE_INV, n, BLOCK_SIZE=BLOCK_SIZE)
     return out
 
+@triton.jit
+def _scale_cast_fp8_amax_kernel(x_ptr, out_ptr, amax_ptr, scale_inv_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    """Fused: compute amax of BF16 input (atomic_max), scale by scale_inv_ptr[0], cast to FP8."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    scale_inv = tl.load(scale_inv_ptr)
+    x = tl.load(x_ptr + offsets, mask=mask)
+    local_amax = tl.max(tl.abs(x.to(tl.float32)), axis=0)
+    tl.atomic_max(amax_ptr, local_amax)
+    tl.store(out_ptr + offsets, (x * scale_inv.to(x.dtype)).to(tl.float8e4nv), mask=mask)
+
+def scale_cast_fp8_delayed(x: torch.Tensor, amax_buf: torch.Tensor, scale_inv_ptr: torch.Tensor) -> torch.Tensor:
+    """Fused: track amax of BF16 x into amax_buf (via atomic_max), scale by scale_inv_ptr[0], cast to FP8.
+    Designed for delayed scaling: amax_buf accumulates across microbatches for use next step."""
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    n = x.numel()
+    BLOCK_SIZE = 1024
+    grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+    _scale_cast_fp8_amax_kernel[grid](x, out, amax_buf, scale_inv_ptr, n, BLOCK_SIZE=BLOCK_SIZE)
+    return out
+
 _E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 # Global amax storage — invisible to torch.compile, updated by autograd function
@@ -591,34 +651,72 @@ def init_fp8_amax_bufs(device, n_layers=12):
     global _fp8_amax_bufs
     _fp8_amax_bufs = torch.full((n_layers,), _fp8_amax_default, dtype=torch.float32, device=device)
 
+_FP8_GRAD_SCALE = 1.0 / 8.0  # scales grad values into E5M2 range; conservative default
+
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, W1, W2, W1_f8=None, W1_s=None, x_f8=None):
+    def forward(ctx, x, W1, W2,
+                W1_f8=None, W1_s=None, x_f8=None, amax_buf=None, act_scale_inv=None,
+                W2_f8=None, post_scale=None, w2_scale=None, post_scale_inv=None, post_amax_buf=None):
         x_flat = x.view((-1, x.shape[-1]))
+        use_fp8_w2 = W2_f8 is not None
+
         if W1_f8 is not None:
             if x_f8 is None:
-                x_f8 = scale_cast_fp8(x_flat)
+                if amax_buf is not None:
+                    x_f8 = scale_cast_fp8_delayed(x_flat, amax_buf, act_scale_inv)
+                else:
+                    x_f8 = scale_cast_fp8(x_flat)
             else:
                 x_f8 = x_f8.view((-1, x_f8.shape[-1]))
-            if isinstance(W1_s, torch.Tensor):
+            if use_fp8_w2:
+                # W1 FP8 matmul → FP8 post (USE_FP8_POST writes relu(pre)² directly as FP8
+                # into aux inside the kernel, avoiding a separate elementwise cast).
+                pre, post_f8 = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, w_scale_ptr=W1_s,
+                                                  use_fp8_post=True, post_scale_inv_ptr=post_scale_inv,
+                                                  post_amax_out=post_amax_buf)
+                # W2 FP8 forward: post_f8 @ W2_f8 * post_scale * w2_scale
+                W2_f8_col_major = W2_f8.T.contiguous().T
+                x3 = torch._scaled_mm(post_f8, W2_f8_col_major,
+                                      scale_a=post_scale, scale_b=w2_scale,
+                                      out_dtype=torch.bfloat16, use_fast_accum=True)
+            elif isinstance(W1_s, torch.Tensor):
                 pre, post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, w_scale_ptr=W1_s)
+                x3 = post @ W2
             else:
                 pre, post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, w_scale=W1_s if W1_s is not None else 1.0)
+                x3 = post @ W2
         else:
             pre, post = linear_relu_square(x_flat, W1)
-        x3 = post @ W2
-        ctx.save_for_backward(x, W1, W2, pre, post)
+            x3 = post @ W2
+
+        if use_fp8_w2:
+            ctx.save_for_backward(x, W1, W2, pre, post_f8)
+            ctx.post_scale = post_scale
+        else:
+            ctx.save_for_backward(x, W1, W2, pre, post)
+        ctx.use_fp8_w2 = use_fp8_w2
         return x3.view(x.shape)
 
     @staticmethod
     def backward(ctx, grad_output):
         x, W1, W2, pre, post = ctx.saved_tensors
-        dW2 = post.T @ grad_output
-        grad_flat = grad_output.view((-1, grad_output.shape[-1]))
+        grad_flat = grad_output.view((-1, grad_output.shape[-1])).contiguous()
+
+        if ctx.use_fp8_w2:
+            grad_s = grad_flat.new_tensor([_FP8_GRAD_SCALE], dtype=torch.float32)
+            grad_f8 = (grad_flat * (1.0 / _FP8_GRAD_SCALE)).to(torch.float8_e5m2)
+            dW2 = torch._scaled_mm(post.T.contiguous(), grad_f8.T.contiguous().T,
+                                   scale_a=ctx.post_scale, scale_b=grad_s,
+                                   out_dtype=torch.bfloat16, use_fast_accum=False)
+        else:
+            dW2 = post.T @ grad_output
+
         dpre = linear_relu_square(grad_flat, W2, aux=pre)
-        dW1 = dpre.T @ x
+        x_2d = x.view(-1, x.shape[-1])
+        dW1 = dpre.T @ x_2d
         dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2, None, None, None
+        return dx.view(x.shape), dW1, dW2, None, None, None, None, None, None, None, None, None, None
 
 # -----------------------------------------------------------------------------
 # Fused Softcapped Cross Entropy
