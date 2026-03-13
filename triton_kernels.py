@@ -402,6 +402,7 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
 @triton.jit
 def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                                  aux_raw_ptr,
+                                 aux_col_raw_ptr,
                                  M, N, K, w_scale, w_scale_ptr,
                                  amax_ptr,
                                  post_scale_inv_ptr,
@@ -417,6 +418,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                                  USE_SCALE_PTR: tl.constexpr,
                                  USE_FP8_POST: tl.constexpr,
                                  TRACK_POST_AMAX: tl.constexpr,
+                                 DOUBLE_WRITE_COL: tl.constexpr,
                                  ):
     dtype = tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -483,8 +485,13 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                 # This lets us keep BLOCK_K=128 and num_stages=4 without SMEM overflow.
                 m_range = offs_am_c + tl.arange(0, BLOCK_SIZE_M)
                 n_range = offs_bn_c + tl.arange(0, BLOCK_SIZE_N // 2)
-                tl.store(aux_raw_ptr + m_range[:, None] * N + n_range[None, :],
-                         (c0_post * post_scale_inv.to(c0_post.dtype)).to(tl.float8e4nv))
+                c0_f8 = (c0_post * post_scale_inv.to(c0_post.dtype)).to(tl.float8e4nv)
+                tl.store(aux_raw_ptr + m_range[:, None] * N + n_range[None, :], c0_f8)
+                if DOUBLE_WRITE_COL:
+                    # Col-major store: dst shape is (N, M), write transposed tile
+                    tl.store(aux_col_raw_ptr + n_range[:, None] * M + m_range[None, :],
+                             tl.trans(c0_f8),
+                             mask=(n_range[:, None] < N) & (m_range[None, :] < M))
             else:
                 aux_desc.store([offs_am_c, offs_bn_c], c0_post)
             # c0_post freed here — acc1 / c1_post will reuse those registers
@@ -503,8 +510,12 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
             if USE_FP8_POST:
                 m_range = offs_am_c + tl.arange(0, BLOCK_SIZE_M)
                 n_range = offs_bn_c + BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
-                tl.store(aux_raw_ptr + m_range[:, None] * N + n_range[None, :],
-                         (c1_post * post_scale_inv.to(c1_post.dtype)).to(tl.float8e4nv))
+                c1_f8 = (c1_post * post_scale_inv.to(c1_post.dtype)).to(tl.float8e4nv)
+                tl.store(aux_raw_ptr + m_range[:, None] * N + n_range[None, :], c1_f8)
+                if DOUBLE_WRITE_COL:
+                    tl.store(aux_col_raw_ptr + n_range[:, None] * M + m_range[None, :],
+                             tl.trans(c1_f8),
+                             mask=(n_range[:, None] < N) & (m_range[None, :] < M))
             else:
                 aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
@@ -518,7 +529,8 @@ def _get_dummy_f32(device):
     return _dummy_f32
 
 def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0, w_scale_ptr=None, amax_out=None,
-                       use_fp8_post=False, post_scale_inv_ptr=None, post_amax_out=None):
+                       use_fp8_post=False, post_scale_inv_ptr=None, post_amax_out=None,
+                       double_write_col=False):
     M, K = a.shape
     N = b.shape[0] if b is not None else b_f8.shape[0]
     dtype = torch.bfloat16
@@ -533,6 +545,11 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0, w_scal
         FORWARD = True
         aux_dtype = torch.float8_e4m3fn if use_fp8_post else dtype
         aux = torch.empty((M, N), device=a.device, dtype=aux_dtype)
+
+    # Allocate col-major buffer for double-write (N, M) — used in backward to skip transpose
+    aux_col = None
+    if double_write_col and FORWARD:
+        aux_col = torch.empty((N, M), device=a.device, dtype=torch.float8_e4m3fn)
 
     if track_amax:
         amax_out.zero_()
@@ -574,6 +591,7 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0, w_scal
     linear_relu_square_kernel[grid](
         a_desc, b_desc, c_desc, aux_desc,
         aux,
+        aux_col if aux_col is not None else dummy,
         M, N, K, w_scale, w_scale_ptr,
         amax_out,
         post_scale_inv_ptr,
@@ -589,11 +607,14 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0, w_scal
         USE_SCALE_PTR=use_scale_ptr,
         USE_FP8_POST=use_fp8_post,
         TRACK_POST_AMAX=track_post_amax,
+        DOUBLE_WRITE_COL=double_write_col and FORWARD,
         num_stages=num_stages,
         num_warps=num_warps
     )
 
     if FORWARD:
+        if double_write_col:
+            return c, aux, aux_col
         return c, aux
     else:
         return c
@@ -670,13 +691,14 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             else:
                 x_f8 = x_f8.view((-1, x_f8.shape[-1]))
             if use_fp8_w2:
-                # W1 FP8 matmul → FP8 post (USE_FP8_POST writes relu(pre)² directly as FP8
-                # into aux inside the kernel, avoiding a separate elementwise cast).
-                pre, post_f8 = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, w_scale_ptr=W1_s,
-                                                  use_fp8_post=True, post_scale_inv_ptr=post_scale_inv,
-                                                  post_amax_out=post_amax_buf)
+                # W1 FP8 matmul → FP8 post with double-write: row-major for W2 forward,
+                # col-major saved for dW2 backward (eliminates post.T.contiguous() transpose).
+                pre, post_f8, post_f8_col = linear_relu_square(
+                    x_flat, W1, a_f8=x_f8, b_f8=W1_f8, w_scale_ptr=W1_s,
+                    use_fp8_post=True, post_scale_inv_ptr=post_scale_inv,
+                    post_amax_out=post_amax_buf, double_write_col=True)
                 # W2 FP8 forward: post_f8 @ W2_f8 * post_scale * w2_scale
-                W2_f8_col_major = W2_f8.T.contiguous().T
+                W2_f8_col_major = fp8_col_major(W2_f8)
                 x3 = torch._scaled_mm(post_f8, W2_f8_col_major,
                                       scale_a=post_scale, scale_b=w2_scale,
                                       out_dtype=torch.bfloat16, use_fast_accum=True)
@@ -691,7 +713,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             x3 = post @ W2
 
         if use_fp8_w2:
-            ctx.save_for_backward(x, W1, W2, pre, post_f8)
+            ctx.save_for_backward(x, W1, W2, pre, post_f8, post_f8_col)
             ctx.post_scale = post_scale
         else:
             ctx.save_for_backward(x, W1, W2, pre, post)
@@ -700,13 +722,17 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, W1, W2, pre, post = ctx.saved_tensors
+        if ctx.use_fp8_w2:
+            x, W1, W2, pre, post, post_col = ctx.saved_tensors
+        else:
+            x, W1, W2, pre, post = ctx.saved_tensors
         grad_flat = grad_output.view((-1, grad_output.shape[-1])).contiguous()
 
         if ctx.use_fp8_w2:
             grad_s = grad_flat.new_tensor([_FP8_GRAD_SCALE], dtype=torch.float32)
             grad_f8 = (grad_flat * (1.0 / _FP8_GRAD_SCALE)).to(torch.float8_e5m2)
-            dW2 = torch._scaled_mm(post.T.contiguous(), grad_f8.T.contiguous().T,
+            # post_col is (N, M) contiguous = post.T already transposed by double-write
+            dW2 = torch._scaled_mm(post_col, fp8_col_major(grad_f8),
                                    scale_a=ctx.post_scale, scale_b=grad_s,
                                    out_dtype=torch.bfloat16, use_fast_accum=False)
         else:
@@ -942,6 +968,47 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
     )
 
 
+# -----------------------------------------------------------------------------
+# FP8 tiled transpose kernel — used by cross-entropy backward
+@triton.jit
+def _fp8_transpose_kernel(
+    src_ptr, dst_ptr,
+    M, N,
+    src_stride_m, src_stride_n,
+    dst_stride_0, dst_stride_1,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    safe_m = tl.minimum(offs_m, M - 1)
+    safe_n = tl.minimum(offs_n, N - 1)
+    tile = tl.load(src_ptr + safe_m[:, None] * src_stride_m + safe_n[None, :] * src_stride_n)
+    mask_T = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+    tl.store(dst_ptr + offs_n[:, None] * dst_stride_0 + offs_m[None, :] * dst_stride_1,
+             tl.trans(tile), mask=mask_T)
+
+def fp8_transpose(src: torch.Tensor) -> torch.Tensor:
+    """Fast tiled transpose for FP8 tensors: returns src.T as a contiguous tensor."""
+    assert src.ndim == 2
+    M, N = src.shape
+    dst = torch.empty((N, M), dtype=src.dtype, device=src.device)
+    BLOCK_M, BLOCK_N = 64, 64
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    _fp8_transpose_kernel[grid](
+        src, dst, M, N,
+        src.stride(0), src.stride(1), dst.stride(0), dst.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, num_warps=4, num_stages=2,
+    )
+    return dst
+
+def fp8_col_major(src: torch.Tensor) -> torch.Tensor:
+    """Make an FP8 tensor column-major. Replaces src.T.contiguous().T."""
+    return fp8_transpose(src).T
+
+
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
@@ -949,7 +1016,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
 
-        w_f8_col_major = w_f8.T.contiguous().T
+        w_f8_col_major = fp8_col_major(w_f8)
 
         logits = torch._scaled_mm(
             x_f8,
@@ -1021,8 +1088,8 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         )
 
         grad_w = torch._scaled_mm(
-            x_f8.T.contiguous(),
-            grad_input.T.contiguous().T,
+            fp8_transpose(x_f8),
+            fp8_col_major(grad_input),
             out_dtype=torch.float32,
             scale_a=x_scale,
             scale_b=grad_scale,

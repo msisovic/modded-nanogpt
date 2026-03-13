@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy, init_fp8_amax_bufs, scale_cast_fp8_delayed
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy, init_fp8_amax_bufs, scale_cast_fp8_delayed, fp8_col_major
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
@@ -196,7 +196,7 @@ def quantize_weights_fp8(model):
         w2_f8 = (c_proj_weights / w2_scales.view(12, 1, 1)).to(torch.float8_e4m3fn)
         # Store transposed: shape (12, dim, mlp_hdim), col-major for _scaled_mm
         for i in range(12):
-            model._mlp_proj_f8[i] = w2_f8[i].T.contiguous().T
+            model._mlp_proj_f8[i] = fp8_col_major(w2_f8[i])
 
         # Update activation delayed scales from previous step's accumulated amaxes
         act_amaxes = model._fp8_layer_amaxes.clamp(min=1e-12)
