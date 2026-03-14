@@ -157,8 +157,8 @@ mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 # -----------------------------------------------------------------------------
 # FP8 pre-quantized MLP weights for Triton kernel
 
-_FP8_ACT_SCALE = 16.0 / torch.finfo(torch.float8_e4m3fn).max  # ~0.036
-_FP8_ACT_SCALE_INV = 1.0 / _FP8_ACT_SCALE  # ~28.0
+_FP8_ACT_AMAX = 32.0  # fixed activation amax for FP8 quantization
+_FP8_ACT_SCALE_INV = torch.finfo(torch.float8_e4m3fn).max / _FP8_ACT_AMAX  # 448/32 = 14.0
 
 def quantize_weights_fp8(model):
     """Pre-quantize MLP weight bank to FP8 for use in linear_relu_square Triton kernel."""
@@ -167,7 +167,6 @@ def quantize_weights_fp8(model):
         if model._mlp_bank_f8 is None:
             model._mlp_bank_f8 = torch.zeros_like(model.mlp_bank, dtype=torch.float8_e4m3fn)
             model._mlp_bank_scales = torch.ones(24, dtype=torch.float32, device=model.mlp_bank.device)
-            model._fp8_layer_amaxes = torch.zeros(12, dtype=torch.float32, device=model.mlp_bank.device)
             model._fp8_scale_buf = torch.ones(1, dtype=torch.float32, device=model.mlp_bank.device)
         # Vectorized: compute all 24 scales and quantize in bulk
         flat = model.mlp_bank.view(24, -1)
@@ -1395,9 +1394,8 @@ class GPT(nn.Module):
                 post_attn = lane0
                 normed = norm(lane0)
                 if use_fp8_here:
-                    amax = normed.detach().abs().max().clamp(min=1e-12)
-                    x_f8 = (normed.detach() * (448.0 / amax)).to(torch.float8_e4m3fn)
-                    self._fp8_scale_buf.copy_(fc_s).mul_(amax).div_(448.0)
+                    x_f8 = (normed * _FP8_ACT_SCALE_INV).to(torch.float8_e4m3fn)
+                    self._fp8_scale_buf.copy_(fc_s).mul_(_FP8_ACT_AMAX / 448.0)
                     mlp_args = (c_fc, c_proj, fc_f8, self._fp8_scale_buf, x_f8)
                 else:
                     mlp_args = (c_fc, c_proj)
@@ -1409,9 +1407,8 @@ class GPT(nn.Module):
                 post_attn = lane0
                 normed = norm(lane0)
                 if use_fp8_here:
-                    amax = normed.detach().abs().max().clamp(min=1e-12)
-                    x_f8 = (normed.detach() * (448.0 / amax)).to(torch.float8_e4m3fn)
-                    self._fp8_scale_buf.copy_(fc_s).mul_(amax).div_(448.0)
+                    x_f8 = (normed * _FP8_ACT_SCALE_INV).to(torch.float8_e4m3fn)
+                    self._fp8_scale_buf.copy_(fc_s).mul_(_FP8_ACT_AMAX / 448.0)
                     mlp_args = (c_fc, c_proj, fc_f8, self._fp8_scale_buf, x_f8)
                 else:
                     mlp_args = (c_fc, c_proj)
@@ -1424,9 +1421,8 @@ class GPT(nn.Module):
                 post_attn = lane0
                 normed = norm(lane1)
                 if use_fp8_here:
-                    amax = normed.detach().abs().max().clamp(min=1e-12)
-                    x_f8 = (normed.detach() * (448.0 / amax)).to(torch.float8_e4m3fn)
-                    self._fp8_scale_buf.copy_(fc_s).mul_(amax).div_(448.0)
+                    x_f8 = (normed * _FP8_ACT_SCALE_INV).to(torch.float8_e4m3fn)
+                    self._fp8_scale_buf.copy_(fc_s).mul_(_FP8_ACT_AMAX / 448.0)
                     mlp_args = (c_fc, c_proj, fc_f8, self._fp8_scale_buf, x_f8)
                 else:
                     mlp_args = (c_fc, c_proj)
@@ -2068,11 +2064,6 @@ for step in range(train_steps + 1):
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        # Log per-layer FP8 activation amaxes (from current scaling)
-        if hasattr(model._orig_mod, '_fp8_layer_amaxes') and model._orig_mod._fp8_layer_amaxes is not None:
-            amaxes = model._orig_mod._fp8_layer_amaxes
-            amax_str = ' '.join(f'{a:.2f}' for a in amaxes.tolist())
-            print0(f"  fp8_act_amaxes: [{amax_str}]")
         model.train()
         # start the clock again
         torch.cuda.synchronize()
