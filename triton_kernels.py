@@ -520,8 +520,8 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0, w_scal
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 256
-    BLOCK_SIZE_K = 128 if use_fp8 else 64
+    BLOCK_SIZE_N = 512 if use_fp8 else 256
+    BLOCK_SIZE_K = 64
     num_stages = 4 if FORWARD else 3
     num_warps = 8
 

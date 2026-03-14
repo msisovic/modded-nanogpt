@@ -2035,40 +2035,19 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    if _profile:
-        _e = {k: (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-              for k in ("forward", "backward", "optimizer")}
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        if _profile and idx == 0: _e["forward"][0].record()
         with torch.profiler.record_function("forward"):
             loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
-        if _profile and idx == grad_accum_steps - 1: _e["forward"][1].record()
         training_manager.sparse_index_share(step)
-        if _profile and idx == 0: _e["backward"][0].record()
         with torch.profiler.record_function("backward"):
             loss.backward()
-        if _profile and idx == grad_accum_steps - 1: _e["backward"][1].record()
         del loss
-    if _profile: _e["optimizer"][0].record()
     with torch.profiler.record_function("optimizer_step"):
         training_manager.step_optimizers(step)
-    if _profile: _e["optimizer"][1].record()
     if _profile:
         _prof_ctx.step()
-        torch.cuda.synchronize()
-        fwd_ms = _e["forward"][0].elapsed_time(_e["forward"][1])
-        bwd_ms = _e["backward"][0].elapsed_time(_e["backward"][1])
-        opt_ms = _e["optimizer"][0].elapsed_time(_e["optimizer"][1])
-        total_ms = fwd_ms + bwd_ms + opt_ms
-        print0(
-            f"[timing step {step:4d}]  "
-            f"forward={fwd_ms:6.1f}ms  backward={bwd_ms:6.1f}ms  "
-            f"optimizer={opt_ms:6.1f}ms  "
-            f"total={total_ms:6.1f}ms",
-            console=True,
-        )
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
