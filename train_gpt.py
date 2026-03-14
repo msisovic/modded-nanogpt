@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy, init_fp8_amax_bufs
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
@@ -153,27 +153,6 @@ def setup_context_t(ctx: torch.autograd.function.FunctionCtx, inputs, output):
     ctx.set_materialize_grads(False)
 
 mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
-
-# -----------------------------------------------------------------------------
-# FP8 pre-quantized MLP weights for Triton kernel
-
-_FP8_ACT_AMAX = 32.0  # fixed activation amax for FP8 quantization
-_FP8_ACT_SCALE_INV = torch.finfo(torch.float8_e4m3fn).max / _FP8_ACT_AMAX  # 448/32 = 14.0
-
-def quantize_weights_fp8(model):
-    """Pre-quantize MLP weight bank to FP8 for use in linear_relu_square Triton kernel."""
-    E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-    with torch.no_grad():
-        if model._mlp_bank_f8 is None:
-            model._mlp_bank_f8 = torch.zeros_like(model.mlp_bank, dtype=torch.float8_e4m3fn)
-            model._mlp_bank_scales = torch.ones(24, dtype=torch.float32, device=model.mlp_bank.device)
-            model._fp8_scale_buf = torch.ones(1, dtype=torch.float32, device=model.mlp_bank.device)
-        # Vectorized: compute all 24 scales and quantize in bulk
-        flat = model.mlp_bank.view(24, -1)
-        scales = flat.abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
-        # Store pure weight scales (act_scale is dynamic, computed per-call)
-        model._mlp_bank_scales[:] = scales.float()
-        model._mlp_bank_f8[:] = (model.mlp_bank / scales.view(12, 2, 1, 1)).to(torch.float8_e4m3fn)
 
 # -----------------------------------------------------------------------------
 # Polar Express
@@ -1233,9 +1212,6 @@ class GPT(nn.Module):
         # Transposed weight storage for faster gradient accumulation
         self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
 
-        self._mlp_bank_f8 = None
-        self._mlp_bank_scales = None
-
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
 
         self.embed = nn.Embedding(self.vocab_size, model_dim)
@@ -1317,13 +1293,6 @@ class GPT(nn.Module):
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
-        # FP8 pre-quantized weights for Triton kernel (no _scaled_mm, no fusion breakage)
-        use_mlp_fp8 = self.training and self._mlp_bank_f8 is not None and not os.environ.get("DISABLE_MLP_FP8")
-        fp8_skip_last = int(os.environ.get("FP8_SKIP_LAST", "0"))
-        if use_mlp_fp8:
-            mlp_f8_all = self._mlp_bank_f8.flatten(0, 1).unbind(0)
-            mlp_fc_f8 = mlp_f8_all[0::2]
-            mlp_fc_scales = [self._mlp_bank_scales[i*2:i*2+1] for i in range(12)]
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
@@ -1368,9 +1337,6 @@ class GPT(nn.Module):
             qkvo_w = attn_weights[i - (i > 6)] if i != 6 else None
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
-            use_fp8_here = use_mlp_fp8 and i < (12 - fp8_skip_last)
-            if use_fp8_here:
-                fc_f8, fc_s = mlp_fc_f8[i], mlp_fc_scales[i]
 
             # Introduce lane1 at parallel_start by copying lane0
             if i == self.parallel_start:
@@ -1392,41 +1358,20 @@ class GPT(nn.Module):
             if i == 6:
                 # MLP-only layer (no attention) @YouJiacheng
                 post_attn = lane0
-                normed = norm(lane0)
-                if use_fp8_here:
-                    x_f8 = (normed * _FP8_ACT_SCALE_INV).to(torch.float8_e4m3fn)
-                    self._fp8_scale_buf.copy_(fc_s).mul_(_FP8_ACT_AMAX / 448.0)
-                    mlp_args = (c_fc, c_proj, fc_f8, self._fp8_scale_buf, x_f8)
-                else:
-                    mlp_args = (c_fc, c_proj)
-                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(normed, *mlp_args)
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
             elif i < self.parallel_start:
                 # Single-stream: attn and mlp both read/write lane0
                 attn_out = attn(norm(lane0), attn_args, qkvo_w)
                 lane0 = resid_lambdas_attn[i] * lane0 + attn_out + x0_inject[i]
                 post_attn = lane0
-                normed = norm(lane0)
-                if use_fp8_here:
-                    x_f8 = (normed * _FP8_ACT_SCALE_INV).to(torch.float8_e4m3fn)
-                    self._fp8_scale_buf.copy_(fc_s).mul_(_FP8_ACT_AMAX / 448.0)
-                    mlp_args = (c_fc, c_proj, fc_f8, self._fp8_scale_buf, x_f8)
-                else:
-                    mlp_args = (c_fc, c_proj)
-                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(normed, *mlp_args)
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
             else:
                 # Parallel: attn reads lane0, mlp reads lane1, both write to both lanes
                 attn_out = attn(norm(lane0), attn_args, qkvo_w)
                 lane0 = resid_lambdas_attn[i] * lane0 + post_lambdas_attn_ln0[i] * attn_out + x0_inject[i]
                 lane1 = resid_lambdas_attn[i] * lane1 + post_lambdas_attn_ln1[i] * attn_out
                 post_attn = lane0
-                normed = norm(lane1)
-                if use_fp8_here:
-                    x_f8 = (normed * _FP8_ACT_SCALE_INV).to(torch.float8_e4m3fn)
-                    self._fp8_scale_buf.copy_(fc_s).mul_(_FP8_ACT_AMAX / 448.0)
-                    mlp_args = (c_fc, c_proj, fc_f8, self._fp8_scale_buf, x_f8)
-                else:
-                    mlp_args = (c_fc, c_proj)
-                mlp_out = ReLUSqrdMLP(normed, *mlp_args)
+                mlp_out = ReLUSqrdMLP(norm(lane1), c_fc, c_proj)
                 lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * mlp_out
                 lane1 = resid_lambdas_mlp[i] * lane1 + post_lambdas_mlp_ln1[i] * mlp_out
 
@@ -1445,14 +1390,13 @@ class GPT(nn.Module):
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
-            losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
-            loss = losses.sum()
+            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
         else:
             logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
             logits_for_loss = logits.float()
-            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
-        return loss
+            loss_per_token = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="none")
+        return loss_per_token
 # -----------------------------------------------------------------------------
 # Distributed data loader
 
@@ -1654,6 +1598,7 @@ class Hyperparameters:
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
+    run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
 
@@ -1984,7 +1929,6 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-quantize_weights_fp8(model)
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
@@ -2008,24 +1952,22 @@ for step in warmup_steps:
     model.eval()
     with torch.no_grad():
         inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
     model.train()
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
-    quantize_weights_fp8(model._orig_mod)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
 del val_loader, train_loader, initial_state
-quantize_weights_fp8(model._orig_mod)
 model.train()
 
 ########################################
@@ -2034,6 +1976,21 @@ model.train()
 train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
 
 gc.collect()
+
+_profile = os.environ.get("PROFILE", "0") == "1"
+if _profile:
+    from torch.profiler import ProfilerActivity
+    def _trace_handler(prof):
+        prof.export_chrome_trace(f"profile-rank{rank}.json.gz")
+        print0(f"Profiler trace written to profile-rank{rank}.json.gz", console=True)
+    _prof_ctx = torch.profiler.profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=3, warmup=1, active=2, repeat=1),
+        on_trace_ready=_trace_handler,
+        with_stack=False,
+        record_shapes=True,
+    )
+    _prof_ctx.__enter__()
 
 training_time_ms = 0
 # start the clock
@@ -2059,7 +2016,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -2078,19 +2035,56 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    if _profile:
+        _e = {k: (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+              for k in ("forward", "backward", "optimizer")}
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
+        if _profile and idx == 0: _e["forward"][0].record()
+        with torch.profiler.record_function("forward"):
+            loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+        if _profile and idx == grad_accum_steps - 1: _e["forward"][1].record()
         training_manager.sparse_index_share(step)
-        loss.backward()
+        if _profile and idx == 0: _e["backward"][0].record()
+        with torch.profiler.record_function("backward"):
+            loss.backward()
+        if _profile and idx == grad_accum_steps - 1: _e["backward"][1].record()
         del loss
-    training_manager.step_optimizers(step)
-    quantize_weights_fp8(model._orig_mod)
+    if _profile: _e["optimizer"][0].record()
+    with torch.profiler.record_function("optimizer_step"):
+        training_manager.step_optimizers(step)
+    if _profile: _e["optimizer"][1].record()
+    if _profile:
+        _prof_ctx.step()
+        torch.cuda.synchronize()
+        fwd_ms = _e["forward"][0].elapsed_time(_e["forward"][1])
+        bwd_ms = _e["backward"][0].elapsed_time(_e["backward"][1])
+        opt_ms = _e["optimizer"][0].elapsed_time(_e["optimizer"][1])
+        total_ms = fwd_ms + bwd_ms + opt_ms
+        print0(
+            f"[timing step {step:4d}]  "
+            f"forward={fwd_ms:6.1f}ms  backward={bwd_ms:6.1f}ms  "
+            f"optimizer={opt_ms:6.1f}ms  "
+            f"total={total_ms:6.1f}ms",
+            console=True,
+        )
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+if _profile:
+    _prof_ctx.__exit__(None, None, None)
+
+if args.run_evals:
+    model.eval()
+    from evals import hellaswag
+    hellaswag.evaluate(model=model, 
+                       schedule_cfg=training_manager.get_forward_args(), 
+                       seq_len=args.val_batch_size // (grad_accum_steps * world_size),
+                       get_bigram_hash=get_bigram_hash, 
+                       print0=print0)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
