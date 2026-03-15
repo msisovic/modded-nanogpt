@@ -419,8 +419,8 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc, aux_f8_desc,
     num_tiles = num_pid_m * num_pid_n
 
     if EMIT_F8:
-        # Use 1.2x previous amax for headroom against activation growth
-        amax_scaled = tl.load(amax_in_ptr).to(tl.float32) * 1.2
+        # Use 1.05x previous amax for headroom against activation growth
+        amax_scaled = tl.load(amax_in_ptr).to(tl.float32) * 1.05
         inv_scale = 448.0 / amax_scaled
         local_max: tl.float32 = 0.0
 
@@ -546,8 +546,8 @@ def linear_relu_square(a, b, aux=None, emit_f8=False, amax_in=None, amax_out=Non
             # Reduce per-program maxes to get new amax
             num_programs = min(NUM_SMS, triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N))
             new_amax = amax_out[:num_programs].max().clamp(min=1e-12)
-            # scale_a must match the scale used during quantization (amax_in * 1.2, not new_amax)
-            scale_a = (amax_in[0].float().clamp(min=1e-12) * 1.2 / 448.0).reshape(1)
+            # scale_a must match the scale used during quantization (amax_in * 1.05, not new_amax)
+            scale_a = (amax_in[0].float().clamp(min=1e-12) * 1.05 / 448.0).reshape(1)
             return c, aux, aux_f8, scale_a, new_amax
         return c, aux
     else:
@@ -569,7 +569,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             x_flat, W1, emit_f8=True, amax_in=amax_in, amax_out=amax_out)
         w2_f8, scale_b = _quantize_w2_to_f8(W2)
         x3 = torch._scaled_mm(post_f8, w2_f8, scale_a=scale_a, scale_b=scale_b,
-                               out_dtype=torch.bfloat16, use_fast_accum=True)
+                               out_dtype=torch.bfloat16, use_fast_accum=False)
         ctx.save_for_backward(x, W1, W2, pre, post)
         ctx.mark_non_differentiable(new_amax)
         return x3.view(x.shape), new_amax
