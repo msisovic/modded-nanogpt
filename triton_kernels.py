@@ -569,7 +569,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             x_flat, W1, emit_f8=True, amax_in=amax_in, amax_out=amax_out)
         w2_f8, scale_b = _quantize_w2_to_f8(W2)
         x3 = torch._scaled_mm(post_f8, w2_f8, scale_a=scale_a, scale_b=scale_b,
-                               out_dtype=torch.bfloat16, use_fast_accum=False)
+                               out_dtype=torch.bfloat16, use_fast_accum=True)
         ctx.save_for_backward(x, W1, W2, pre, post)
         ctx.mark_non_differentiable(new_amax)
         return x3.view(x.shape), new_amax
