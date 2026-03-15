@@ -530,16 +530,22 @@ def linear_relu_square(a, b, aux=None, emit_f8=False):
 
 _POST_RELU2_SCALE_A = 10000.0 / 448.0
 
+def quantize_w2_to_f8(w_bf16):
+    """Quantize [K, N] BF16 weight to FP8 column-major + scale. No caching."""
+    w = w_bf16.detach()
+    amax = w.abs().amax().float().clamp(min=1e-12)
+    scale = (amax / 448.0).reshape(1)
+    w_f8 = (w / scale).to(torch.float8_e4m3fn).T.contiguous().T
+    return w_f8, scale
+
+
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, W1, W2, W2_f8=None, W2_scale=None, scale_a=None):
+    def forward(ctx, x, W1, W2, W2_f8, W2_scale, scale_a):
         x_flat = x.view((-1, x.shape[-1]))
-        pre, post, post_f8 = linear_relu_square(x_flat, W1, emit_f8=(W2_f8 is not None))
-        if W2_f8 is not None:
-            x3 = torch._scaled_mm(post_f8, W2_f8, scale_a=scale_a, scale_b=W2_scale,
-                                   out_dtype=torch.bfloat16, use_fast_accum=True)
-        else:
-            x3 = post @ W2
+        pre, post, post_f8 = linear_relu_square(x_flat, W1, emit_f8=True)
+        x3 = torch._scaled_mm(post_f8, W2_f8, scale_a=scale_a, scale_b=W2_scale,
+                               out_dtype=torch.bfloat16, use_fast_accum=True)
         ctx.save_for_backward(x, W1, W2, pre, post)
         return x3.view(x.shape)
 
