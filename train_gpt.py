@@ -1192,6 +1192,11 @@ class GPT(nn.Module):
         self.mlp_bank = nn.Parameter(torch.empty(12, 2, mlp_hdim, model_dim))  # (12, 2, 3072, 768)
         self.mlp_bank.reshape = (24, mlp_hdim, model_dim)  # Shape for sharding: (24, 3072, 768)
 
+        # FP8 W2 cache: pre-quantized c_proj weights for faster matmul
+        self.register_buffer('mlp_w2_f8_T', torch.zeros(12, model_dim, mlp_hdim, dtype=torch.float8_e4m3fn))
+        self.register_buffer('mlp_w2_scales', torch.ones(12, 1, dtype=torch.float32))  # [12,1] not [12] to avoid inductor 0-dim bug
+        self.register_buffer('mlp_w2_scale_a', torch.tensor([10000.0 / 448.0], dtype=torch.float32))  # pre-allocated, 1-dim
+
         # improved init scale by @YouJiacheng and @srashedll
         std = 0.5 * model_dim ** -0.5
         bound = (3 ** 0.5) * std
@@ -1254,6 +1259,14 @@ class GPT(nn.Module):
         for name, param in self.named_parameters():
             param.label = name.replace('.weight', '')
 
+    @torch.no_grad()
+    def update_mlp_w2_cache(self):
+        w2 = self.mlp_bank[:, 1]  # [12, mlp_hdim, model_dim]
+        scales = w2.abs().amax(dim=(1, 2)).clamp(min=1e-12) / 448.0  # [12]
+        w2_f8 = (w2 / scales.view(12, 1, 1)).to(torch.float8_e4m3fn)  # [12, mlp_hdim, model_dim]
+        self.mlp_w2_f8_T.copy_(w2_f8.permute(0, 2, 1))  # store as [12, model_dim, mlp_hdim]
+        self.mlp_w2_scales.copy_(scales.unsqueeze(1))  # [12, 1]
+
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
@@ -1293,6 +1306,8 @@ class GPT(nn.Module):
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
+        mlp_w2_f8 = self.mlp_w2_f8_T.unbind(0)   # 12 × [model_dim, mlp_hdim]
+        mlp_w2_s = self.mlp_w2_scales.unbind(0)   # 12 × [1]
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
@@ -1337,6 +1352,8 @@ class GPT(nn.Module):
             qkvo_w = attn_weights[i - (i > 6)] if i != 6 else None
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
+            c_proj_f8 = mlp_w2_f8[i].T  # F-contiguous [mlp_hdim, model_dim]
+            c_proj_s = mlp_w2_s[i]
 
             # Introduce lane1 at parallel_start by copying lane0
             if i == self.parallel_start:
@@ -1358,20 +1375,20 @@ class GPT(nn.Module):
             if i == 6:
                 # MLP-only layer (no attention) @YouJiacheng
                 post_attn = lane0
-                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj, c_proj_f8, c_proj_s, self.mlp_w2_scale_a)
             elif i < self.parallel_start:
                 # Single-stream: attn and mlp both read/write lane0
                 attn_out = attn(norm(lane0), attn_args, qkvo_w)
                 lane0 = resid_lambdas_attn[i] * lane0 + attn_out + x0_inject[i]
                 post_attn = lane0
-                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj, c_proj_f8, c_proj_s, self.mlp_w2_scale_a)
             else:
                 # Parallel: attn reads lane0, mlp reads lane1, both write to both lanes
                 attn_out = attn(norm(lane0), attn_args, qkvo_w)
                 lane0 = resid_lambdas_attn[i] * lane0 + post_lambdas_attn_ln0[i] * attn_out + x0_inject[i]
                 lane1 = resid_lambdas_attn[i] * lane1 + post_lambdas_attn_ln1[i] * attn_out
                 post_attn = lane0
-                mlp_out = ReLUSqrdMLP(norm(lane1), c_fc, c_proj)
+                mlp_out = ReLUSqrdMLP(norm(lane1), c_fc, c_proj, c_proj_f8, c_proj_s, self.mlp_w2_scale_a)
                 lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * mlp_out
                 lane1 = resid_lambdas_mlp[i] * lane1 + post_lambdas_mlp_ln1[i] * mlp_out
 
@@ -1929,6 +1946,7 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
+model.update_mlp_w2_cache()  # initialize FP8 W2 cache before compile
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
@@ -1963,6 +1981,7 @@ for step in warmup_steps:
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    model._orig_mod.update_mlp_w2_cache()
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
@@ -2028,6 +2047,7 @@ for step in range(train_steps + 1):
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    model._orig_mod.update_mlp_w2_cache()
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)

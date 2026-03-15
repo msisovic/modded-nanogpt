@@ -400,7 +400,7 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
 # Triton kernel for MLP: relu(x @ W1.T)^2, by @andrewbriand, @jrauvola
 
 @triton.jit
-def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
+def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc, aux_f8_desc,
                                  M, N, K,
                                  BLOCK_SIZE_M: tl.constexpr,
                                  BLOCK_SIZE_N: tl.constexpr,
@@ -408,6 +408,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                                  GROUP_SIZE_M: tl.constexpr,
                                  NUM_SMS: tl.constexpr,
                                  FORWARD: tl.constexpr,
+                                 EMIT_F8: tl.constexpr,
                                  ):
     dtype = tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -453,6 +454,9 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
             c0_post = tl.maximum(c0, 0)
             c0_post = c0_post * c0_post
             aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+            if EMIT_F8:
+                aux_f8_desc.store([offs_am_c, offs_bn_c],
+                    tl.minimum(c0_post * (448.0 / 10000.0), 448.0).to(tl.float8e4nv))
 
         c1 = acc1.to(dtype)
         if not FORWARD:
@@ -465,9 +469,12 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
             c1_post = tl.maximum(c1, 0)
             c1_post = c1_post * c1_post
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
+            if EMIT_F8:
+                aux_f8_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2],
+                    tl.minimum(c1_post * (448.0 / 10000.0), 448.0).to(tl.float8e4nv))
 
 
-def linear_relu_square(a, b, aux=None):
+def linear_relu_square(a, b, aux=None, emit_f8=False):
     M, K = a.shape
     N, K = b.shape
     dtype = a.dtype
@@ -479,18 +486,22 @@ def linear_relu_square(a, b, aux=None):
         FORWARD = True
         aux = torch.empty((M, N), device=a.device, dtype=dtype)
 
+    EMIT_F8 = FORWARD and emit_f8
+    aux_f8 = torch.empty((M, N), device=a.device, dtype=torch.float8_e4m3fn) if EMIT_F8 else aux
+
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
     BLOCK_SIZE_K = 64
-    num_stages = 4 if FORWARD else 3
+    num_stages = (3 if EMIT_F8 else 4) if FORWARD else 3
     num_warps = 8
 
     a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
     b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
     c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
     aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+    aux_f8_desc = TensorDescriptor.from_tensor(aux_f8, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
 
     def grid(META):
         return (min(
@@ -499,7 +510,7 @@ def linear_relu_square(a, b, aux=None):
         ), )
 
     linear_relu_square_kernel[grid](
-        a_desc, b_desc, c_desc, aux_desc,
+        a_desc, b_desc, c_desc, aux_desc, aux_f8_desc,
         M, N, K,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
@@ -507,20 +518,28 @@ def linear_relu_square(a, b, aux=None):
         GROUP_SIZE_M=1,
         NUM_SMS=NUM_SMS,
         FORWARD=FORWARD,
+        EMIT_F8=EMIT_F8,
         num_stages=num_stages,
         num_warps=num_warps
     )
 
     if FORWARD:
-        return c, aux
+        return c, aux, aux_f8 if EMIT_F8 else None
     else:
         return c
 
+_POST_RELU2_SCALE_A = 10000.0 / 448.0
+
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, W1, W2):
-        pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
-        x3 = post @ W2
+    def forward(ctx, x, W1, W2, W2_f8=None, W2_scale=None, scale_a=None):
+        x_flat = x.view((-1, x.shape[-1]))
+        pre, post, post_f8 = linear_relu_square(x_flat, W1, emit_f8=(W2_f8 is not None))
+        if W2_f8 is not None:
+            x3 = torch._scaled_mm(post_f8, W2_f8, scale_a=scale_a, scale_b=W2_scale,
+                                   out_dtype=torch.bfloat16, use_fast_accum=True)
+        else:
+            x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
         return x3.view(x.shape)
 
@@ -531,7 +550,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
         dW1 = dpre.T @ x
         dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2
+        return dx.view(x.shape), dW1, dW2, None, None, None
 
 # -----------------------------------------------------------------------------
 # Fused Softcapped Cross Entropy
