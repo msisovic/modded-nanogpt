@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy, init_fp8_amax_bufs
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
@@ -153,28 +153,6 @@ def setup_context_t(ctx: torch.autograd.function.FunctionCtx, inputs, output):
     ctx.set_materialize_grads(False)
 
 mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
-
-# -----------------------------------------------------------------------------
-# FP8 pre-quantized MLP weights for Triton kernel
-
-_FP8_ACT_SCALE = 16.0 / torch.finfo(torch.float8_e4m3fn).max  # ~0.036
-_FP8_ACT_SCALE_INV = 1.0 / _FP8_ACT_SCALE  # ~28.0
-
-def quantize_weights_fp8(model):
-    """Pre-quantize MLP weight bank to FP8 for use in linear_relu_square Triton kernel."""
-    E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-    with torch.no_grad():
-        if model._mlp_bank_f8 is None:
-            model._mlp_bank_f8 = torch.zeros_like(model.mlp_bank, dtype=torch.float8_e4m3fn)
-            model._mlp_bank_scales = torch.ones(24, dtype=torch.float32, device=model.mlp_bank.device)
-            model._fp8_layer_amaxes = torch.zeros(12, dtype=torch.float32, device=model.mlp_bank.device)
-            model._fp8_scale_buf = torch.ones(1, dtype=torch.float32, device=model.mlp_bank.device)
-        # Vectorized: compute all 24 scales and quantize in bulk
-        flat = model.mlp_bank.view(24, -1)
-        scales = flat.abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
-        # Store pure weight scales (act_scale is dynamic, computed per-call)
-        model._mlp_bank_scales[:] = scales.float()
-        model._mlp_bank_f8[:] = (model.mlp_bank / scales.view(12, 2, 1, 1)).to(torch.float8_e4m3fn)
 
 # -----------------------------------------------------------------------------
 # Polar Express
@@ -1080,6 +1058,7 @@ class AttnArgs:
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
+    xsa_alpha: torch.Tensor | None
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -1150,6 +1129,14 @@ class CausalSelfAttention(nn.Module):
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
+        # Gated XSA (arXiv:2603.09078) with learnable strength
+        # remove a per-head fraction tanh(α) of the y-component aligned with v̂
+        # only on non-paired layers since v has shape (B,T,H,D) here
+        if attn_args.xsa_alpha is not None and not self.paired:
+            vn = F.normalize(v, dim=-1, eps=1e-4)
+            proj = (y * vn).sum(-1, keepdim=True)
+            alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(1, 1, self.num_heads, 1)
+            y = y - alpha * proj * vn
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
@@ -1246,9 +1233,6 @@ class GPT(nn.Module):
         # Transposed weight storage for faster gradient accumulation
         self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
 
-        self._mlp_bank_f8 = None
-        self._mlp_bank_scales = None
-
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
 
         self.embed = nn.Embedding(self.vocab_size, model_dim)
@@ -1267,6 +1251,9 @@ class GPT(nn.Module):
         # Per-sublayer residual scaling: [num_layers, 2] where [:,0]=attn, [:,1]=mlp
         # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
         self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5))
+
+        # Per-(layer, head) learnable XSA gate; zero-init: tanh(0)=0 disables XSA at step 0
+        self.xsa_alphas = nn.Parameter(torch.zeros(num_layers, num_heads))
 
         pad = (-num_layers * 2 - 3) % dist.get_world_size()
         self.scalars = nn.Parameter(
@@ -1310,6 +1297,10 @@ class GPT(nn.Module):
         veg = self.ve_gate_bank.unbind(0)
         attn_gates = [*ag[:6], None, *ag[6:]]
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
+        # XSA on every non-paired attn layer {1, 3, 4, 7, 8, 10}; paired layers {0,2,5,9} and the MLP-only layer 6 are skipped
+        xsa_layers_set = {1, 3, 4, 7, 8, 10}
+        xsa_alpha_per_layer = self.xsa_alphas.unbind(0)
+        xsa_alphas = [xsa_alpha_per_layer[i] if i in xsa_layers_set else None for i in range(self.num_layers)]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
@@ -1318,13 +1309,6 @@ class GPT(nn.Module):
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
-        # FP8 pre-quantized weights for Triton kernel (no _scaled_mm, no fusion breakage)
-        use_mlp_fp8 = self.training and self._mlp_bank_f8 is not None and not os.environ.get("DISABLE_MLP_FP8")
-        fp8_skip_last = int(os.environ.get("FP8_SKIP_LAST", "0"))
-        if use_mlp_fp8:
-            mlp_f8_all = self._mlp_bank_f8.flatten(0, 1).unbind(0)
-            mlp_fc_f8 = mlp_f8_all[0::2]
-            mlp_fc_scales = [self._mlp_bank_scales[i*2:i*2+1] for i in range(12)]
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
@@ -1364,16 +1348,14 @@ class GPT(nn.Module):
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i],
-                train_max_seq_len=train_max_seq_len
+                train_max_seq_len=train_max_seq_len,
+                xsa_alpha=xsa_alphas[i],
             )
             # Select weights from banks
             attn_idx = i - (i > 6) if i != 6 else None
             qkvo_w = attn_weights[attn_idx] if attn_idx is not None else None
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
-            use_fp8_here = use_mlp_fp8 and i < (12 - fp8_skip_last)
-            if use_fp8_here:
-                fc_f8, fc_s = mlp_fc_f8[i], mlp_fc_scales[i]
 
             # Select attention variant for this layer
             attn = self.attn_paired if i in self.paired_head_layers else self.attn
@@ -1385,15 +1367,7 @@ class GPT(nn.Module):
                 attn_in = x_backout if x_backout is not None else x
                 attn_out = attn(norm(attn_in), attn_args, qkvo_w)
                 x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
-            normed = norm(x)
-            if use_fp8_here:
-                amax = normed.detach().abs().max().clamp(min=1e-12)
-                x_f8 = (normed.detach() * (448.0 / amax)).to(torch.float8_e4m3fn)
-                self._fp8_scale_buf.copy_(fc_s).mul_(amax).div_(448.0)
-                mlp_args = (c_fc, c_proj, fc_f8, self._fp8_scale_buf, x_f8)
-            else:
-                mlp_args = (c_fc, c_proj)
-            x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(normed, *mlp_args)
+            x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
             if i == 3:
                 skip_connection = x
             if i == 7:
@@ -1608,7 +1582,7 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1440  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1410  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1748,6 +1722,7 @@ class TrainingManager():
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "bigram_lambdas": {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "resid_lambdas":  {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "xsa_alphas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
@@ -1755,7 +1730,7 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas", "xsa_alphas",  # Small, fast
             "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "qk_bank", "vo_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
@@ -1947,7 +1922,6 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-quantize_weights_fp8(model)
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
@@ -1982,13 +1956,11 @@ for step in warmup_steps:
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
-    quantize_weights_fp8(model._orig_mod)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
 del val_loader, train_loader, initial_state
-quantize_weights_fp8(model._orig_mod)
 model.train()
 
 ########################################
@@ -2027,11 +1999,6 @@ for step in range(train_steps + 1):
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        # Log per-layer FP8 activation amaxes (from current scaling)
-        if hasattr(model._orig_mod, '_fp8_layer_amaxes') and model._orig_mod._fp8_layer_amaxes is not None:
-            amaxes = model._orig_mod._fp8_layer_amaxes
-            amax_str = ' '.join(f'{a:.2f}' for a in amaxes.tolist())
-            print0(f"  fp8_act_amaxes: [{amax_str}]")
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -2054,7 +2021,6 @@ for step in range(train_steps + 1):
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
-    quantize_weights_fp8(model._orig_mod)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
